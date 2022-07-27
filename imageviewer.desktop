@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ImageViewer
+Comment=A simple PyQt5 Image Viewer
+Exec=imageviewer.py %f
+Terminal=true
+Type=Application
+Icon=mirage
+Keywords=Image;Viewer;Graphical;
+Categories=PyQt5;Graphics;2DGraphics;Viewer;
+MimeType=image/bmp;image/gif;image/jpeg;image/jpg;image/pjpeg;image/png;image/tiff;image/x-bmp;image/x-pcx;image/x-png;image/x-portable-anymap;image/x-portable-bitmap;image/x-portable-graymap;image/x-portable-pixmap;image/x-sun-raster;image/x-tga;image/x-xbitmap;image/x-xpixmap;image/svg+xml;
