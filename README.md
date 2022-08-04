@@ -24,7 +24,7 @@ and on low power computers like Raspberry Pi 2
 ### LXDE File association
 
 1. Copy the .desktop file to `.local\share\applications\imageviewer.desktop`.
-1. If `imageviewer.py` is not in the path, modifie the Exec= entry to the
+1. If `imageviewer.py` is not in the path, modify the Exec= entry to the
    absolute path, eg
    ```
    Exec=/usr/bin/imageviewer.py %f
@@ -38,11 +38,13 @@ and on low power computers like Raspberry Pi 2
 
 
 ## Features
-- Uses PyQt5
+- Uses PyQt5 and Python 2.7
 - Works on Raspberry Pi 2 with LXDE
 - Works on Windows
 - Loads Qt-supported images (jpeg, png...)
-- Fast open dialog box on slow network drives
+- Fast open dialog box on slow network drives, automatic deferral of file stat
+  fetching after one second timeout, substring keyboard search, history
+  navigation, directory path button navigation.
 - Slideshow of current image directory
 - Pseudo numeric file sorting for open dialog and slideshow of current image
   directory

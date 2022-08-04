@@ -28,14 +28,22 @@ XXX Read/store settings with QSettings (Window position, MRU, zoom, fit mode,
     slideshow timer interval, see saveGeometry, restoreGeometry)
 XXX Use numpy for image effects (gamma, auto-gamma, brightness, contrast, etc)
     See https://note.nkmk.me/en/python-numpy-image-processing/
+XXX Take a look on whether logging needs %r because of unicode (print to non
+    unicode consoles raises UnicodeEncodeError)
+    See https://stackoverflow.com/questions/21129020/how-to-fix-unicodedecodeerror-ascii-codec-cant-decode-byte
+    See https://stackoverflow.com/questions/33955276/python3-unicodedecodeerror
+    See https://stackoverflow.com/questions/5419/python-unicode-and-the-windows-console
 """
 
 import datetime
 import logging
 import os
-import Queue
+import Queue as queue
+import stat
+import string
 import sys
 import thread
+import time
 
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
@@ -62,7 +70,7 @@ def setup_logger(logger):
     """
     Setup the logger with a line break handler
     """
-    logging_format = "%(asctime).23s %(levelname)s:%(filename)s(%(lineno)d): %(message)s"
+    logging_format = "%(asctime).23s %(levelname)s:%(filename)s(%(lineno)d):[%(thread)d] %(message)s"
 
     logger_handler = LineHandler()
     logger_handler.setFormatter(logging.Formatter(logging_format))
@@ -86,6 +94,61 @@ def exc(*args, **kwargs):
     logger.exception(*args, **kwargs)
 
 
+def os_path_isroot(path):
+    # Checking path == os.path.dirname(path) is the recommended way
+    # of checking for the root directory
+    # This works for both regular paths and SMB network shares
+    dirname = os.path.dirname(path)
+    return (path == dirname)
+
+
+def os_path_abspath(path):
+    # The os.path library (split and the derivatives dirname, basename) slash
+    # terminates root directories, eg
+    
+    #   os.path.split("\\") ('\\', '')
+    #   os.path.split("\\dir1") ('\\', 'dir1')
+    #   os.path.split("\\dir1\\dir2") ('\\dir1', 'dir2')
+    #   os.path.split("\\dir1\\dir2\\") ('\\dir1\\dir2', '')
+    
+    # this includes SMB network shares, where the root is considered to be the
+    # pair \\host\share\ eg 
+    
+    #   os.path.split("\\\\host\\share") ('\\\\host\\share', '')
+    #   os.path.split("\\\\host\\share\\") ('\\\\host\\share\\', '')
+    #   os.path.split("\\\\host\\share\\dir1") ('\\\\host\\share\\', 'dir1')
+
+    # abspath also slash terminates regular root directories, 
+    
+    #  os.path.abspath("\\") 'C:\\'
+    #  os.path.abspath("\\..") 'C:\\'
+
+    # unfortunately fails to slash terminate SMB network shares root
+    # directories, eg
+    
+    #  os.path.abspath("\\\\host\\share\\..") \\\\host\\share
+    #  os.path.abspath("\\\\host\\share\\..\\..") '\\\\host\\share
+
+    # Without the trailing slash, functions like isabs fail, eg
+
+    #   os.path.isabs("\\\\host\\share") False
+    #   os.path.isabs("\\\\host\\share\\") True
+    #   os.path.isabs("\\\\host\\share\\dir") True
+    #   os.path.isabs("\\\\host\\share\\..") True
+    
+    # See https://stackoverflow.com/questions/34599208/python-isabs-does-not-recognize-windows-unc-path-as-absolute-path
+
+    
+    # This fixes that by making sure root directories are always slash
+    # terminated
+    abspath = os.path.abspath(os.path.expanduser(path))
+    if ((not abspath.endswith(os.sep)) and os_path_isroot(abspath)):
+        abspath += os.sep
+
+    info("os_path_abspath %r is %r", path, abspath)
+    return abspath
+
+
 # XXX Support animations via QMovie of a local temp file or QImageReader of
 #     QBuffer/QIODevice of a python buffer in the file cache, to avoid PyQt
 #     locking the UI thread
@@ -99,18 +162,58 @@ first_image = -float("inf")
 last_image = float("inf")
 slideshow_interval_ms = 5000
 most_recently_used_max_count = 10
+stat_timeout_secs = 0.25
+# QApplication.keyboardInputInterval() is 400ms, which is too short
+listview_keyboard_search_timeout_secs = 0.75
 
-def prefetch_files(queue_in, queue_out):
+
+# queue is an old style class, inherit from object to make newstyle
+class Queue(queue.Queue, object):
+    """
+    Queue with a clear method to flush/drain the queue
+    """
+    def __init__(self, *args, **kwargs):
+        # Call init directly since super can't be used in oldstyle classes which
+        # queue is
+        queue.Queue.__init__(self, *args, **kwargs)
+
+    def clear(self):
+        """
+        Clear the queue.
+        
+        This clears the queue until it finds no more entries, as such it's race
+        condition prone unless there are no simultaneous threads putting items
+        in the queue.
+        """
+        info("Queue.clear")
+        # Doing gets seems to be the safest and simplest way of draining the
+        # queue, other ways may be faster but more brittle or more complicated
+        # See https://stackoverflow.com/questions/6517953/clear-all-items-from-the-queue
+        try:
+            while (True):
+                entry = self.get_nowait()
+                info("Drained entry %.200r", entry)
+        except queue.Empty:
+            pass
+        info("Queue.clear done")
+
+
+def prefetch_files(request_queue, response_queue):
+    info("prefetch_files starts")
     while (True):
-        filepath = queue_in.get()
+        filepath = request_queue.get()
         if (filepath is None):
+            response_queue.put(None)
             break
 
-        info("worker prefetching %s", repr(filepath))
-        # Store file contents, don't convert to QImage yet:
-        # - Converting to QImage here blocks the GUI thread, which makes
+        info("worker prefetching %r", filepath)
+        # Store file contents, don't use QImage yet because:
+        # - Using QImage.load will block the GUI thread for the whole duration
+        #   of the load and conversion, which makes prefetching useless.
+        # - Just Converting to QImage here blocks the GUI thread, which makes
         #   prefetching useless
-        # - Converting the data to QImage explodes cache memory requirements
+        # - Converting the data to QImage increases 100x fold the cache memory
+        #   footprint
         # - Doing QImage conversion on the GUI thread is not that taxing and
         #   doesn't stall for long
         try:
@@ -119,10 +222,12 @@ def prefetch_files(queue_in, queue_out):
         except:
             # If there was an error, let the caller handle it by placing None
             # data
-            exc("Unable to prefetch %s", repr(filepath))
+            exc("Unable to prefetch %r", filepath)
             data = None
-        info("worker prefetched %s", repr(filepath))
-        queue_out.put((filepath, data))
+        info("worker prefetched %r", filepath)
+        response_queue.put((filepath, data))
+
+    info("prefetch_files ends")
 
 
 def split_base_index(s):
@@ -216,27 +321,92 @@ def size_to_human_friendly_units(u):
     return "%0.2f %s" % (u * 1.0/d, unit)
 
 
+class StatFetcher(QThread):
+    statFetched = pyqtSignal(tuple)
+
+    def __init__(self, request_queue, response_queue = None):
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+        return super(StatFetcher, self).__init__()
+
+    def run(self):
+        info("StatFetcher started")
+        while (True):
+            entry = self.request_queue.get()
+            if (entry is None):
+                self.response_queue.put(None)
+                break
+            request_id, filepath = entry
+            
+            info("Popped stat request id %d for %r", request_id, filepath)
+            try:
+                filestat = os.stat(filepath)
+                
+            except Exception as e:
+                exc("Exception when fetching stat request id %d for %r", request_id, filepath)
+                filestat = None
+
+            # Put the stat in the response queue so it can be collected
+            # synchronously to the GUI thread, and emit the statFetched signal
+            # it too so it can also be done asynchronously to the GUI thread
+
+            entry = (request_id, filepath, filestat)            
+            info("Responding stat request id %d for %r", request_id, filepath)
+            self.response_queue.put(entry)
+            # Theoretically if this queue fills and blocks it would deadlock
+            # updateDirpath, but Qt connection queue sizes are supposed to be
+            # bounded only by memory. Other options would be to call statFetched
+            # directly in the non deferred part of updateDirPath and
+            # blockSignal/disconnect()/have an entry flag indicating if it
+            # should be emitted or not
+            self.statFetched.emit(entry)
+        info("StatFetcher ended")
+
+
 class FileDialog(QDialog):
     """
-    Qt file dialog is extremely slow on Raspberry Pi (minutes to pop), implement
-    a simple one that just works
-    """
-    # XXX Do substring search on key input. Qt already does prefix search, but
-    #     unfortunately it uses the default MatchStartsWith when
-    #     qabstractitemview.keyboardsearch calls model.match and qlistwidget
-    #     setModel cannot be called 
-    #
-    #     See https://code.woboq.org/qt5/qtbase/src/widgets/itemviews/qabstractitemview.cpp.html
-    #     See https://code.woboq.org/qt5/qtbase/src/corelib/itemmodels/qabstractitemmodel.h.html
-    #     See https://code.woboq.org/qt5/qtbase/src/widgets/itemviews/qlistwidget.cpp.html#_ZN11QListWidget8setModelEP18QAbstractItemModel
+    Qt file dialog (native or not) is extremely slow on SMB network drives with
+    ~200 files on Raspberry Pi (minutes to pop), implement a simple one that
+    just works
 
-    # XXX Do directory navigation on left, right
+    Features:
+    - Keyboard navigation
+    - Mouse navigation
+    - Keyboard history navigation
+    - Keyboard substring search
+    - Threaded file stat
+    - Background file stat if foreground exceeded a given timeout
+
+    """
     # XXX Think about what initialization should be elsewhere if the dialog is
     #     kept around and reused
     
     def __init__(self, filepath, parent=None):
         super(FileDialog, self).__init__(parent)
 
+        self.statRequestQueue = Queue()
+        self.statResponseQueue = Queue()
+        self.requestId = 0
+
+        # navigationHistoryIndex points to the current entry in the history, -1
+        # if empty. updateDirpath will add the current dirpath to the history
+        # and increment the index. Lower indices in navigationHistory are older
+        # history entries.
+        self.navigationHistory = []
+        self.navigationHistoryIndex = -1
+        
+        num_stat_fetchers = 10
+        self.statFetchers = []
+        for i in xrange(num_stat_fetchers):
+            info("Creating statFetcher %d", i)
+            statFetcher = StatFetcher(self.statRequestQueue, self.statResponseQueue)
+            # Note the default connection parameter AutoConnection will use
+            # QueuedConnection (verified), which is what is desired in this case
+            # that uses cross thread signals
+            statFetcher.statFetched.connect(self.statFetched)
+            statFetcher.start()
+            self.statFetchers.append(statFetcher)
+            
         self.setWindowTitle("Open File")
 
         self.layout = QVBoxLayout()
@@ -257,9 +427,12 @@ class FileDialog(QDialog):
         listWidget = QListWidget()
         listWidget.itemDoubleClicked.connect(self.entryDoubleClicked)
         listWidget.itemSelectionChanged.connect(lambda : self.edit.setText(listWidget.currentItem().text()))
+        listWidget.installEventFilter(self)
+        listWidget.setTabKeyNavigation(False)
         self.listWidget = listWidget
+        self.listKeyDownTime = 0
+        self.listKeyDownText = ""
         
-    
         self.layout.addWidget(listWidget)
 
         total = QLabel()
@@ -279,71 +452,225 @@ class FileDialog(QDialog):
 
         dirpath, basename = os.path.split(filepath)
 
-        self.updateDirpath(dirpath)
+        self.dirpath = ""
+        self.navigate(dirpath)
         self.listWidget.setFocus()
-        self.listWidget.setCurrentItem(self.listWidget.findItems(basename, Qt.MatchExactly)[0])
         self.resize(500, 400)
+
+    def statFetched(self, entry):
+        info("fetched stat %r", entry)
+        
+        request_id, filepath, filestat = entry
+        # This could get emits for a previous id, discard them, in particular
+        # this could receive emits after the dialog has been dismissed (since
+        # dismissing the dialog doesn't close it, just hides it)
+        if (self.requestId == request_id):
+            if (stat.S_ISDIR(filestat.st_mode)):
+                filename = os.path.basename(filepath)
+                items = self.listWidget.findItems(filename, Qt.MatchExactly)
+                if (len(items) == 1):
+                    item = items[0]
+                    # XXX Cache this font?
+                    bold_font = item.font()
+                    bold_font.setBold(True)
+                    item.setFont(bold_font)
+
+                else:
+                    error("found %d items for stat %r, expected one", len(items), filepath)
+
+            # XXX This could check if it's in deferred mode and remove any one
+            #     entry (or all) from the queue, since the queue is not used
+            #     once in deferred mode. This prevent the bulk of the stales
+            #     puts that need to be cleanup the next updateDirpath
+
+        else:
+            info("Ignoring stale statFetched emit id %d vs. %d %r vs %r for %r", 
+                self.requestId, request_id, self.dirpath, os.path.dirname(filepath), filepath)
+
+    def cleanup(self):
+        """
+        This clears the queues
+
+        Note that after clearing the request queue, a thread could still be
+        servicing a previous request, so stale emits can still be emitted and
+        queued in the response queue even after the queues have been cleared.
+        """
+        info("cleanup")
+        # Set dirpath to None so any further emits are ignored for good measure
+        self.dirpath = None
+        self.clearQueues()
+
+        info("Signaling %d fetchers to end", len(self.statFetchers))
+        for fetcher in self.statFetchers:
+            self.statRequestQueue.put(None)
+            entry = ""
+            while (entry is not None):
+                entry = self.statResponseQueue.get()
+                info("Drained entry %.200r", entry)
+        info("Signaled")
+
+    def clearQueues(self):
+        """
+        Note this doesn't guarantee the queues remain empty when the function
+        returns in the presence of other threads putting items on them
+        (specifically, the worker thread may still be servicing a previous
+        request after clearQueues is called, so it can still put items/emit).
+        """
+        info("clearQueues")
+        self.statRequestQueue.clear()
+        self.statResponseQueue.clear()
+
+    def accept(self, *args, **kwargs):
+        info("accept")
+        # Note closing a dialog actually calls hide(), not closeEvent, cleanup
+        # needs to be called from accept/reject
+        self.cleanup()
+        return super(FileDialog, self).accept(*args, **kwargs)
+
+    def reject(self, *args, **kwargs):
+        info("reject")
+        # Note closing a dialog actually calls hide(), not closeEvent, cleanup
+        # needs to be called from accept/reject
+        self.cleanup()
+        return super(FileDialog, self).reject(*args, **kwargs)
 
 
     def updateDirpath(self, dirpath):
-        dirpath = unicode(dirpath)
-        dirpath = os.path.abspath(os.path.expanduser(dirpath))
+        # Only navigate calls this, should pass absolute and unicode
+        assert os.path.isabs(dirpath) and isinstance(dirpath, unicode)
 
         # listdir and isdir can take time on network drives
         QApplication.setOverrideCursor(Qt.WaitCursor)
 
+        # Clear any pending (stale) requests or responses
+        # Note there may be stale emits and puts in the response queue even
+        # after clearing, but they are discarded at fetchedStat time based on
+        # the request id
+        self.clearQueues()
+        
         info("listdir")
         names = os.listdir(dirpath)
         info("listdired %d files", len(names))
 
         filenames = []
         dirnames = []
-        
-        for i, name in enumerate(names):
-            path = os.path.join(dirpath, name)
-            _, ext = os.path.splitext(name)
-            # XXX isdir for each file takes a long time on network drives with 
-            #     lots of images, thread and or defer it?
-            is_dir = False
-            if (False):
-                print "isdir", name, i, len(names)
-                is_dir = os.path.isdir(path)
-                print "isdir done"
-            if (is_dir):
-                dirnames.append(name)
 
-            elif ((ext.lower() in supported_extensions) or True):
-                filenames.append(name)
-        
-        # XXX Allow sorting by date (getting the date will be slow, use some
-        #     latency hiding)
+        # Create a new request id and request all stats, the request id will be
+        # used in the puts and emits to be able to tell the current
+        # updateDirpath from stale reponses from a previous updateDirpath
+        self.requestId += 1
+        for name in names:
+            path = os.path.join(dirpath, name)
+            info("Requesting stat id %d for %r", self.requestId, path)
+            self.statRequestQueue.put((self.requestId, path))
+
+        stat_start_time_secs = time.time()
+        processed_names = len(names)
+        while (processed_names > 0):
+            if (time.time() - stat_start_time_secs > stat_timeout_secs):
+                info("Stat timed out, deferring further stats")
+                # Switch all to non directories, this will cause a different
+                # list than with non deferred stats in the following ways:
+                # - directories won't be clustered on top
+                # - the not-yet-processed directories won't be displayed in bold
+                #   until the deferred stat is processed
+                # - files won't be filtered by supported extensions
+                #
+                # but there's little that can be done in that case since there's
+                # no filename vs. dir information until all the stats have been
+                # fetched, and modifying the list after it's show is bad UX
+                # since the user may be interacting with it
+                #
+                # XXX Switching to deferred will leave all remaining puts as
+                #     stale items in the response queue since the statFetched
+                #     handler doesn't remove them (it's not aware of deferred
+                #     vs. non deferred). These stale puts will be discarded with
+                #     the next requestId but it's not clean to leave those
+                #     around, fix?
+                #     Note most of these puts will be removed by clearQueues()
+                #     rather than filtered by request id anyway.
+                #     Note this is not the only source of stale puts, there's a
+                #     small source of stale puts even after clearQueues() if
+                #     some thread was still servicing a request when
+                #     clearQueues() happened
+                
+                filenames = names
+                dirnames = []
+                break
+            request_id, filepath, filestat = self.statResponseQueue.get()
+            # filestat could be None if there was a transient error, etc, in that
+            # case, default to non directory
+            is_dir = ((filestat is not None) and stat.S_ISDIR(filestat.st_mode))
+            name = os.path.basename(filepath)
+
+            # Ignore stale requests from old IDs.
+            #
+            # This could use the dirpath to tell requests apart, but it's not
+            # clear if it's theoretically possible to get stale requests for the
+            # current path if there's a fast switch from pathA to pathB to pathA
+            # again
+            if (request_id == self.requestId):
+                _, ext = os.path.splitext(name)
+                
+                if (is_dir):
+                    dirnames.append(name)
+
+                elif (ext.lower() in supported_extensions):
+                    filenames.append(name)
+                processed_names -= 1
+
+            else:
+                info("Ignoring stale put id %d vs. %d %r vs. %r for %r", 
+                    self.requestId, request_id, dirpath, os.path.dirname(filepath), filepath)
+
+        # XXX Allow sorting by date if stats were not deferred?
         dirnames.sort(cmp=cmp_numerically)
         filenames.sort(cmp=cmp_numerically)
 
         self.listWidget.clear()
-        if (os.path.dirname(dirpath) != dirpath):
+        # Add ".." to navigate to parent if not root
+        if (not os_path_isroot(dirpath)):
             self.listWidget.addItem("..")
         self.listWidget.addItems(dirnames)
-        # Make items for dirs bold
-        if (self.listWidget.count() > 0):
-            bold_font = self.listWidget.item(0).font()
-            bold_font.setBold(True)
-            for i in xrange(self.listWidget.count()):
-                item = self.listWidget.item(i)
-                item.setFont(bold_font)
         self.listWidget.addItems(filenames)
-        
-        if (self.listWidget.count() > 0):
-            self.listWidget.setCurrentItem(self.listWidget.item(0))
 
         self.total.setText("%d files and dirs" % self.listWidget.count())
 
+        # Focus on the child coming from, if any
+        # XXX If this is doing history navigation it should focus on the
+        #     previous entry in the history?
+        if (self.dirpath.startswith(dirpath)):
+            dirname = ""
+            basename = self.dirpath
+            while (len(basename) > len(dirpath)):
+                basename, dirname = os.path.split(basename)
+            
+            info("path %r dirpath %r dirname %r ", dirpath, self.dirpath, dirname)
+
+            if (dirname != ""):
+                items = self.listWidget.findItems(dirname, Qt.MatchExactly)
+                if (len(items) == 1):
+                    self.listWidget.setCurrentItem(items[0])
+
+                else:
+                    error("Expected one item for %r, found %d %s", dirname, len(items), [item.text() for item in items])
+        
+        # Count could be 0 on empty root dirs
+        # XXX Also on invalid ones, but that's probably not properly handled yet
+        #     anyway
+        elif (self.listWidget.count() > 0):
+            self.listWidget.setCurrentItem(self.listWidget.item(0))
+
+        # Clear the path buttons by removing from the layout and setting the
+        # parent to None (otherwise the parent will still keep a reference and 
+        # they will still be displayed)
         while (self.pathLayout.count() > 0): 
             item = self.pathLayout.takeAt(0)
-            # eg stretches are not widgets
+            # widget() can be None for eg stretches
             if (item.widget() is not None):
                 item.widget().setParent(None)
             
+        # Convert path to list of directory names
         dirname = dirpath
         names = []
         while True:
@@ -352,16 +679,14 @@ class FileDialog(QDialog):
                 names.append(dirname)
                 break
             names.append(basename)
-
         names.reverse()
-        info("dir names are %s", names)
 
+        # Build the path buttons
+        info("dir names are %s", names)
         for i, name in enumerate(names):
-            # XXX There's a bug in LXDE where the root button switches between /
-            #     and // as buttons are pressed
             button = QToolButton()
             button.setText(name)
-            button_path = str.join(os.path.sep, names[:i+1])
+            button_path = os.path.join(*names[:i+1])
             # Note that lambdas in Python don't capture loop-modified variables, 
             # only the last iteration value is captured. To prevent that
             # the loop-modified variable needs to be set as default value of a
@@ -375,44 +700,40 @@ class FileDialog(QDialog):
         self.pathLayout.addStretch()
         
         self.dirpath = dirpath
-
         self.dirnames = dirnames
         self.filenames = filenames
 
         QApplication.restoreOverrideCursor()
 
-    def navigate(self, path = None):
+
+    def navigate(self, path = None, add_to_history = True):
         if (path is None):
             path = self.edit.text()
-        info("navigate %s", repr(path))
+        info("navigate %r", path)
+        
         if (not os.path.isabs(path)):
             path = os.path.expanduser(path)
             path = os.path.join(self.dirpath, path)
         
-        # Make absolute and normalize ..
-        path = os.path.abspath(path)
+        # Make absolute and normalize (this resolves ".." anywhere, but
+        # specifically the trailing ".." that may have been added when
+        # doubleclicking on the listwidget)
+        path = os_path_abspath(path)
+        path = unicode(path)
 
+        info("abspath is %r", path)
         if (os.path.isdir(path)):
-            # Update with the directory contents, focus the list on the children
-            # coming from, if any
-            dirname = ""
-            if (self.dirpath.startswith(path)):
-                dirname = self.dirpath[len(path)+1:].split(os.path.sep)    
-                dirname = dirname[0]
-                
-            info("path %s dirpath %s dirname %s ", repr(path), repr(self.dirpath), repr(dirname))
+            if (add_to_history):
+                self.navigationHistoryIndex += 1
+                # Trim the history and push the current path (could also insert
+                # instead of trimming, but feels more confusing UX-wise?)
+                self.navigationHistory = self.navigationHistory[:self.navigationHistoryIndex]
+                self.navigationHistory.append(path)
+                info("Added %r to history %d/%d %r", path, 
+                    self.navigationHistoryIndex, len(self.navigationHistory), 
+                    self.navigationHistory)
 
             self.updateDirpath(path)
-
-            if (dirname != ""):
-                
-                items = self.listWidget.findItems(dirname, Qt.MatchExactly)
-                if (len(items) == 1):
-                    self.listWidget.setCurrentItem(items[0])
-
-                else:
-                    # XXX This is hit on LXDE when accessing the root path /
-                    error("Expected one item for %s, found %d %s", repr(dirname), len(items), [item.text() for item in items])
 
         else:
             # XXX This should probably be a function rather than having the
@@ -420,6 +741,127 @@ class FileDialog(QDialog):
             # XXX Dialog could also return list of files and the current dir
             self.chosenFilepath = path
             self.accept()
+
+    def eventFilter(self, source, event):
+        """
+        Do listWidget keyboard navigation on left/right/backpace.
+
+        Do listWidget history navigation on alt+left/alt+right
+
+        Do listWidget substring search on key input. Qt already does prefix
+        search, but unfortunately it uses the default MatchStartsWith when
+        qabstractitemview.keyboardsearch calls model.match and Qlistwidget
+        setModel cannot be called with a model that changes that behavior
+        because it's disabled
+        
+        See https://code.woboq.org/qt5/qtbase/src/widgets/itemviews/qabstractitemview.cpp.html
+        See https://code.woboq.org/qt5/qtbase/src/corelib/itemmodels/qabstractitemmodel.h.html
+        See https://code.woboq.org/qt5/qtbase/src/widgets/itemviews/qlistwidget.cpp.html#_ZN11QListWidget8setModelEP18QAbstractItemModel
+
+        Another option is to derive from QListWidget and reimplement
+        keyboardSearch
+
+        XXX Do directory num files calculation on spacebar/alt+enter, all on shift+alt+enter? 
+
+        """
+        if (event.type() == QEvent.KeyPress):
+            info("eventFilter %r key %d text %r", event.text(), event.key(), event.text())
+            assert (source is self.listWidget)
+            if (event.key() in [Qt.Key_Backspace, Qt.Key_Left]):
+                if (event.modifiers() & Qt.AltModifier):
+                    if (0 < self.navigationHistoryIndex < len(self.navigationHistory)):
+                        info("Navigating history %d/%d %r", self.navigationHistoryIndex, 
+                            len(self.navigationHistory), self.navigationHistory)
+                        self.navigationHistoryIndex -= 1
+                        path = self.navigationHistory[self.navigationHistoryIndex]
+                        self.navigate(path, add_to_history=False)
+                
+                else:
+                    self.navigate("..")
+                return True
+
+            elif (event.key() == Qt.Key_Right):
+                if (event.modifiers() & Qt.AltModifier):
+                    if (0 <= self.navigationHistoryIndex < len(self.navigationHistory) - 1):
+                        info("Navigating history %d/%d %r", self.navigationHistoryIndex, 
+                            len(self.navigationHistory), self.navigationHistory)
+                        self.navigationHistoryIndex += 1
+                        path = self.navigationHistory[self.navigationHistoryIndex]
+                        self.navigate(path, add_to_history=False)
+                
+                else:
+                    self.navigate()
+                return True
+
+            elif (
+                (event.text() != "") and (event.text() in string.printable) and 
+                (event.key() != Qt.Key_Tab)
+                ):
+
+                event_time = time.time()
+                current_row = self.listWidget.currentIndex().row()
+                enter_pressed = ((event.key() ==  Qt.Key_Enter) or (event.key() == Qt.Key_Return))
+                
+                if ((event_time - self.listKeyDownTime) < listview_keyboard_search_timeout_secs):
+                    if (enter_pressed):
+                        # XXX Allow to go back if shift+enter is pressed?
+                        current_row += 1
+
+                    else:
+                        self.listKeyDownText += event.text()
+                    
+                elif (enter_pressed):
+                    return False
+                
+                else:
+                    self.listKeyDownText = event.text()
+                    current_row += 1
+                
+                self.listKeyDownTime = event_time
+
+                # XXX This could also hide the unmatched items instead of just
+                #     traversing to the next matching item? or have a
+                #     search/filter textedit
+                
+                # This could use model().match(Qt.MatchContains) or derive from
+                # QListWidget and override keyboardSearch but this way is simple
+                # enough
+                new_current_item = None
+                for i in xrange(self.listWidget.count()):
+                    row = (current_row + i) % self.listWidget.count()
+                    item = self.listWidget.item(row)
+                    info("Checking item %d/%d %r vs. %r", row, self.listWidget.count(), 
+                        item.text().lower(), self.listKeyDownText.lower())
+                    if (self.listKeyDownText.lower() in item.text().lower()):
+                        info("found item %r", item.text())
+                        new_current_item = item
+                        break
+
+                if (new_current_item is not None):
+                    self.listWidget.setCurrentItem(new_current_item)
+                
+                else:
+                    self.listKeyDownText = self.listKeyDownText[:-1]
+
+                # XXX QToolTip is a simple solution to display the current
+                #     search string but not ideal: the tooltip fades if the
+                #     text didn't change (because eg return or an invalid
+                #     character is pressed), instead of restarting the timer on
+                #     every showtext. Could use an explicit QLabel out of the 
+                #     layout.
+                #
+                #     See https://stackoverflow.com/questions/65022624/how-create-a-visual-aid-for-tablewidget
+                QToolTip.showText(
+                    self.listWidget.parentWidget().mapToGlobal(self.listWidget.geometry().bottomRight()), 
+                    self.listKeyDownText, 
+                    self.listWidget, 
+                    QRect(), 
+                    int(listview_keyboard_search_timeout_secs * 1000.0)
+                )
+
+                return True
+                
+        return super(FileDialog, self).eventFilter(source, event)
 
     def entryDoubleClicked(self, item):
         self.navigate()
@@ -470,7 +912,11 @@ class ImageWidget(QLabel):
 
 
     def resizePixmap(self, size):
-        info("resizing pixmap from %s to %s", self.originalPixmap.size(), size)
+        info("resizing pixmap from %s to %s and %s", self.originalPixmap.size(), size, self.size())
+        
+        # XXX Reset scroll if resizing window (resizes, fullscreen), or clamp 
+        #     below
+
         pixmap = self.originalPixmap
 
         if (self.gamma != 1.0):
@@ -607,8 +1053,8 @@ class ImageViewer(QMainWindow):
         # XXX This could have a max_size_bytes instead
         self.cached_files_max_count = 20
 
-        self.prefetch_queue_in = Queue.Queue()
-        self.prefetch_queue_out = Queue.Queue()
+        self.prefetch_request_queue = Queue()
+        self.prefetch_response_queue = Queue()
         # XXX Check any relationship between prefetch and cache counts, looks
         #     like there shouldn't be any even if the current is evicted from
         #     lur since the current is also kept separately? (although prefetch
@@ -618,9 +1064,7 @@ class ImageViewer(QMainWindow):
         self.prefetcher_count = (self.prefetched_images_max_count / 2) + 1
 
         for i in xrange(self.prefetcher_count):
-            thread.start_new_thread(prefetch_files, (self.prefetch_queue_in, self.prefetch_queue_out))
-
-        
+            thread.start_new_thread(prefetch_files, (self.prefetch_request_queue, self.prefetch_response_queue))
         
         w = QWidget(self)
         self.setCentralWidget(w)
@@ -684,6 +1128,43 @@ class ImageViewer(QMainWindow):
         self.move(ag.topLeft())
         self.resize(width - frame_width, height - frame_height)
 
+    def clearRequests(self):
+        info("clearRequests")
+
+        info("Clearing requests")
+        # These need to be cleared manually since they need to be removed from 
+        # prefetch_pending
+        try:
+            filepath = self.prefetch_request_queue.get_nowait()
+            info("cleared request for %r", filepath)
+            self.prefetch_pending.remove(filepath)
+
+        except queue.Empty:
+            pass
+        info("Cleared requests")
+        
+
+    def clearQueues(self):
+        info("clearQueues")
+        self.prefetch_request_queue.clear()
+        self.prefetch_response_queue.clear()
+        self.prefetch_pending.clear()
+
+    def cleanup(self):
+        info("Signaling %d prefetchers to end", self.prefetcher_count)
+        for _ in xrange(self.prefetcher_count):
+            self.prefetch_request_queue.put(None)
+            self.prefetch_response_queue.get()
+        info("Signaled")
+        
+    def closeEvent(self, event):
+        info("closeEvent")
+        # XXX Ignore cleanup at closeEvent time since it blocks unnecessarily
+        #     at exit time when there are pending prefetches
+        # self.cleanup()
+
+        return super(ImageViewer, self).closeEvent(event)
+
     def eventFilter(self, source, event):
         if (event.type() == QEvent.MouseButtonDblClick):
             assert (source is self.imageWidget)
@@ -700,6 +1181,12 @@ class ImageViewer(QMainWindow):
         filepath = None
         if (self.slideshow_timer is not None):
             self.slideshow_timer.stop()
+
+        # Remove prefetches that haven't been serviced yet to prevent prefetches
+        # fighting for filesystem bandwidth with the filedialog list and stat
+        # (note the prefetches in flight will still be serviced and put in the
+        # reponse queue)
+        self.clearRequests()
 
         dirpath = os.path.curdir if self.image_filepath is None else self.image_filepath
         if (False):
@@ -742,10 +1229,10 @@ class ImageViewer(QMainWindow):
 
         XXX The above problem could be related to using lambdas in a loop?
         """
-        info("setRecentFile %s", repr(filepath))
+        info("setRecentFile %r", filepath)
 
         # XXX This needs to remove duplicates?
-        self.recent_filepaths.insert(0, os.path.abspath(filepath))
+        self.recent_filepaths.insert(0, os_path_abspath(filepath))
         if (len(self.recent_filepaths) > most_recently_used_max_count):
             self.recent_filepaths.pop(-1)
 
@@ -773,7 +1260,7 @@ class ImageViewer(QMainWindow):
         filepath = clipboard.text()
         filepaths = filepath.splitlines()
         
-        info("openFromClipboard %s %s", repr(filepath), repr(filepaths))
+        info("openFromClipboard %r %r", filepath, filepaths)
         if (filepath != ""):
             if (len(filepaths) > 1):
                 self.image_filepaths = filepaths
@@ -792,7 +1279,7 @@ class ImageViewer(QMainWindow):
         #     See https://stackoverflow.com/questions/2007103/how-can-i-disable-clear-of-clipboard-on-exit-of-pyqt-application
         # XXX This could copy the .lst or all the files in the current slideshow
         #     separated by newlines
-        info("copyToClipboard %s", repr(self.image_filepath))
+        info("copyToClipboard %r", self.image_filepath)
         clipboard = qApp.clipboard()
         
         clipboard.setText(self.image_filepath)
@@ -812,9 +1299,9 @@ class ImageViewer(QMainWindow):
 
         for i, entry in enumerate(self.cached_files):
             entry_filepath, entry_data = entry
-            ## print "cache entry", repr(entry_filepath), "vs", repr(filepath)
+            dbg("cache entry %r vs. %r", entry_filepath, filepath)
             if (filepath == entry_filepath):
-                info("cache hit for %s", repr(filepath))
+                info("cache hit for %r", filepath)
                 self.cached_files.pop(i)
                 # Put it at the beginning of the LRU cache
                 self.cached_files.insert(0, entry)
@@ -822,31 +1309,31 @@ class ImageViewer(QMainWindow):
 
         else:
 
-            info("cache miss for %s", repr(filepath))
+            info("cache miss for %r", filepath)
             
             # The filepath is not in the cache, request if not already pending
             if (filepath not in self.prefetch_pending):
-                info("prefetch pending miss for %s", repr(filepath))
-                info("ordering prefetch for %s", repr(filepath))
-                self.prefetch_queue_in.put(filepath)
+                info("prefetch pending miss for %r", filepath)
+                info("ordering prefetch for %r", filepath)
+                self.prefetch_request_queue.put(filepath)
                 self.prefetch_pending.add(filepath)
 
             else:
-                info("prefetch pending hit for %s", repr(filepath))
+                info("prefetch pending hit for %r", filepath)
                 
             # Drain the requests as they are satisfied until the requested one
             # is found. Note this won't be in order if there are more than one
             # prefetcher threads
             while (True):
-                entry_filepath, entry_data = self.prefetch_queue_out.get()
+                entry_filepath, entry_data = self.prefetch_response_queue.get()
                 
                 self.prefetch_pending.remove(entry_filepath)
 
                 if (entry_data is not None):
                     if (len(self.cached_files) >= self.cached_files_max_count):
-                        info("evicting %s for %s", repr(self.cached_files[-1][0]), repr(filepath))
+                        info("evicting %r for %r", self.cached_files[-1][0], filepath)
                         self.cached_files.pop(-1)
-                    info("inserting in cache %s", repr(entry_filepath))
+                    info("inserting in cache %r", entry_filepath)
                     self.cached_files.insert(0, (entry_filepath, entry_data))
 
                 if (entry_filepath == filepath):
@@ -855,26 +1342,29 @@ class ImageViewer(QMainWindow):
         return entry_data
             
     def loadImage(self, filepath, index = None, count = None):
-        info("loadImage %s %s %s", repr(filepath), index, count)
+        info("loadImage %r %s %s", filepath, index, count)
         assert isinstance(filepath, unicode) 
         if (filepath.lower().endswith(".lst")):
+            lst_filepath = filepath
             filepaths = []
             try:
-                with open(filepath, "r") as f:
+                info("loading lst file %r", lst_filepath)
+                with open(lst_filepath, "r") as f:
                     filepaths = f.readlines()
+                info("loaded lst file %r", lst_filepath)
 
             except:
-                exc("Unable to read %s", filepath)
+                exc("Unable to read %s", lst_filepath)
             
             if (len(filepaths) == 0):
                 QMessageBox.information(self, "Image Viewer",
-                    "Cannot load %s." % filepath)
+                    "Cannot load %s." % lst_filepath)
                 return
             
             filepaths = [unicode(filepath.strip()) for filepath in filepaths]
             for i, filepath in enumerate(filepaths):
                 if (not os.path.isabs(filepath)):
-                    filepaths[i] = os.path.join(os.path.dirname(filepath), filepath)
+                    filepaths[i] = os.path.join(os.path.dirname(lst_filepath), filepath)
                 
             filepath = filepaths[0]
             self.image_filepaths = filepaths
@@ -886,10 +1376,7 @@ class ImageViewer(QMainWindow):
             # If there's no index and count information, reset filenames cache
             if (index is None):
                 self.image_filepaths = None
-            # Update the image index early so it's skipped if it cannot be
-            # loaded
-            self.image_index = index
-
+            
         # Update these early in case the image fails to load other filepaths can
         # still be cycled
         if ((self.image_filepaths is not None) and (len(self.image_filepaths) > 1)):
@@ -899,29 +1386,36 @@ class ImageViewer(QMainWindow):
             self.nextImageAct.setEnabled(True)
             self.slideshowAct.setEnabled(True)
 
-        info("QImaging %s", repr(filepath))
+        info("QImaging %r", filepath)
         self.statusBar().showMessage("Loading...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         data = self.getDataFromCache(filepath)
         QApplication.restoreOverrideCursor()
         if (data is None):
-            # XXX This should skip the image in case it cannot be loaded
             QMessageBox.information(self, "Image Viewer",
                     "Cannot load %s." % filepath)
-            return
+            image = None
 
-        self.statusBar().showMessage("Converting...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        image = QImage.fromData(data)
-        QApplication.restoreOverrideCursor()
-        self.statusBar().clearMessage()
-        info("QImaged %s", repr(filepath)) 
+        else:
+
+            self.statusBar().showMessage("Converting...")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            image = QImage.fromData(data)
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+            info("QImaged %r", filepath)
         
-        if (image.isNull()):
-            # XXX This should skip the image in case it cannot be loaded
-            QMessageBox.information(self, "Image Viewer",
-                    "Invalid image file %s." % filepath)
-            return
+            if (image.isNull()):
+                QMessageBox.information(self, "Image Viewer",
+                        "Invalid image file %s." % filepath)
+                image = None
+
+        if (image is None):
+            # Create a dummy image, this is the easiest way of preventing
+            # exceptions everywhere when an invalid file is encountered
+            # (prev/next navigation, etc)
+            image = QImage(10, 10, QImage.Format_RGB32)
+            image.fill(Qt.black)
 
         self.image_filepath = filepath
         
@@ -942,7 +1436,7 @@ class ImageViewer(QMainWindow):
         self.statusFilepath.setText(filepath)
         self.statusResolution.setText("%d x %d x %d BPP" % (image.size().width(), image.size().height(), image.depth()))
         self.statusSize.setText("%s / %s (%s)" % (
-            size_to_human_friendly_units(len(data)), 
+            size_to_human_friendly_units(len(data) if data is not None else 0), 
             size_to_human_friendly_units(image.byteCount()),
             size_to_human_friendly_units(
                 sum([len(entry_data) for entry_filepath, entry_data in self.cached_files]) + 
@@ -951,7 +1445,16 @@ class ImageViewer(QMainWindow):
                 0
                 )
         ))
-        self.statusDate.setText("%s" % datetime.datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M:%S"))
+
+        try:
+            filemtime = os.path.getmtime(filepath)
+            
+        except:
+            exc("Unable to get the filetime for %s", filepath)
+            filemtime = 0
+
+        filedate = datetime.datetime.fromtimestamp(filemtime)
+        self.statusDate.setText("%s" % filedate.strftime("%Y-%m-%d %H:%M:%S"))
         self.statusIndex.setText("%d / %d" % (1 if index is None else index + 1, 1 if count is None else count))
         info("Statused")
 
@@ -1041,11 +1544,17 @@ class ImageViewer(QMainWindow):
         info("gotoImage %s", delta)
         if (self.image_filepaths is None):
             image_dirname = os.path.dirname(self.image_filepath)
-            info("listing %s", repr(image_dirname))
-            QApplication.setOverrideCursor(Qt.WaitCursor)        
-            filenames = os.listdir(image_dirname)
+            info("listing %r", image_dirname)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                filenames = os.listdir(image_dirname)
+
+            except:
+                # This can fail if the host is down or if the path is invalid,
+                # in that case return empty filenames
+                filenames = []
             QApplication.restoreOverrideCursor()
-            info("listed %s", repr(image_dirname))
+            info("listed %r", image_dirname)
             
             # XXX Right now this ignores .lst files because it would replace 
             #     image_filepaths, fix?
@@ -1062,7 +1571,17 @@ class ImageViewer(QMainWindow):
             filepaths = self.image_filepaths
         
         filepath = None
-        prev_i = filepaths.index(self.image_filepath)
+
+        # This could be not in list if an invalid file was introduced
+        # XXX This needs error handling if the current dirpath is invalid, 
+        #     in which case filepaths is empty and should go directly to show
+        #     the open dialog box
+        try:
+            prev_i = filepaths.index(self.image_filepath)
+
+        except ValueError as e:
+            prev_i = 0
+
         if (delta == first_image):
             i = 0
 
@@ -1094,8 +1613,8 @@ class ImageViewer(QMainWindow):
                 if ((filepath not in self.prefetch_pending) and 
                     # XXX Have a set for cached images instead of a an all() reduce
                     all([entry_filepath != filepath for entry_filepath, entry_data in self.cached_files])):
-                    info("ordering prefetch for %s", repr(filepath))
-                    self.prefetch_queue_in.put(filepath)
+                    info("ordering prefetch for %r", filepath)
+                    self.prefetch_request_queue.put(filepath)
                     self.prefetch_pending.add(filepath)
                 
                 delta = -delta

@@ -1,6 +1,11 @@
 [Desktop Entry]
+# Copy this file to .local\share\applications\imageviewer.desktop
+# Set the association with 
+#   xdg-mime default imageviewer.desktop image/jpeg
 Name=ImageViewer
 Comment=A simple PyQt5 Image Viewer
+# The Exec entry needs to be in the path or an absolute path that cannot use
+# shell variables like ~ etc
 Exec=imageviewer.py %f
 Terminal=true
 Type=Application
