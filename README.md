@@ -41,7 +41,12 @@ and on low power computers like Raspberry Pi 2
 - Uses PyQt5 and Python 2.7
 - Works on Raspberry Pi 2 with LXDE
 - Works on Windows
-- Loads Qt-supported images (jpeg, png...)
+- Loads Qt-supported images (currently PyQt5 reports support for .bmp, .dds,
+  .gif, .icns, .ico, .jp2, .jpeg, .jpg, .mng, .pbm, .pgm, .png, .ppm, .svg,
+  .svgz, .tga, .tif, .tiff, .wbmp, .webp, .xbm, .xpm)
+- Play/pause animated images (currently only GIF, PyQt5 fails in different ways
+  to support other animated image formats like APNG, MNG, multipage TIFF,
+  animated WEBP)
 - Fast open dialog box on slow network drives, automatic deferral of file stat
   fetching after one second timeout, substring keyboard search, history
   navigation, directory path button navigation.
@@ -73,4 +78,3 @@ and on low power computers like Raspberry Pi 2
 - Code cleanup
 - More image filters (brightness, contrast, auto-gamma, etc)
 - Save configuration, window & dialog position
-- GIF support

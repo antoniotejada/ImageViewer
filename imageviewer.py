@@ -20,6 +20,16 @@ Stored at
     ~\.config\mimeapps.list
 
 
+Sample image files
+    Static webp
+    https://developers.google.com/speed/webp/gallery1
+
+    Animated webp, apng, mng, gif
+    https://ezgif.com/help/alternative-animated-image-formats 
+
+    Multipage tiff (can also be saved with Irfanview)
+    https://www.nightprogrammer.org/development/multipage-tiff-example-download-test-image-file/
+
 XXX Missing code cleanup (camelcasing vs snake, proper log levels, refactoring)
 XXX Missing file/attribute reading error support
 XXX Missing bug fixing, esp when a file fails to load
@@ -152,15 +162,41 @@ def os_path_abspath(path):
 # XXX Support animations via QMovie of a local temp file or QImageReader of
 #     QBuffer/QIODevice of a python buffer in the file cache, to avoid PyQt
 #     locking the UI thread
+#     See https://code.woboq.org/qt5/qtbase/src/gui/image/qimage.cpp.html#_ZN6QImage8fromDataEPKhiPKc
 #     Also see http://blog.ssokolow.com/archives/2019/08/14/displaying-an-image-or-animated-gif-in-qt-with-aspect-ratio-preserving-scaling/
 
-# XXX Check QImageReader for supportedFormats
-# XXX Check tie Image I/O plugins for tga, tiff webp
-image_extensions = [".bmp", ".jfif", ".jpg", ".jpeg", ".png", ".pbm", ".pgm", ".ppm", ".xbm", ".xpm", ".tga", ".tiff"]
+# XXX Use pillow instead which supports more formats? (not clear about the last
+#     version for Python 2.7)
+#     See https://stackoverflow.com/questions/71112986/retrieve-a-list-of-supported-read-file-extensions-formats
+# XXX Note PyQt5 doesn't support JPEG compressed TIFF
+#     Eg https://www.nightprogrammer.org/wp-uploads/2013/02/multipage_tif_example.tif
+#     fails with 
+#       TIFFReadDirectory: Warning, Unknown field with tag 347 (0x15b) encountered.
+#       foo: JPEG compression support is not configured.
+#       foo: Sorry, requested compression method is not configured.
+# XXX Even if that TIFF is saved as lzw, it will load the first page but it
+#     won't report as animated
+# XXX Note PyQt5 doesn't report mng as animated, it will only load the first frame
+# XXX Note PyQt5 doesn't report apng as animated, it will only load the first frame
+#     fails with 
+#           libpng warning: No space in chunk cache for unknown chunk
+# XXX Note PyQt5 fails to load animated webp, static webp load ok
+# This is currently 
+# ['.bmp', '.dds', '.gif', '.icns', '.ico', '.jp2', '.jpeg', '.jpg', '.mng', 
+#  '.pbm', '.pgm', '.png', '.ppm', '.svg', '.svgz', '.tga', '.tif', '.tiff', 
+#  '.wbmp', '.webp', '.xbm', '.xpm']
+image_extensions = [".%s" % fmt for fmt in QImageReader.supportedImageFormats()]
 supported_extensions = image_extensions + [".lst"]
 first_image = -float("inf")
 last_image = float("inf")
 slideshow_interval_ms = 5000
+# XXX This interval is from the end of the current frame load, which causes
+#     variance depending on how much each frame took to load, in addition it's
+#     hard to set some fps from this since it's interval+load time. Should this
+#     be from frame to frame at the risk of maybe (verify?) making the UI
+#     unresponsive because of back to back re-rendering? 
+# XXX Should this be dynamic depending on QImageReader information?
+animation_interval_ms = 100  
 most_recently_used_max_count = 10
 stat_timeout_secs = 0.25
 # QApplication.keyboardInputInterval() is 400ms, which is too short
@@ -887,11 +923,15 @@ class ImageWidget(QLabel):
         self.scroll = 0
 
     def setPixmap(self, pixmap):
+        """
+        Caller needs to call resizePixmap to update
+        """
         self.originalPixmap = pixmap
-        self.scroll = 0
-        self.resizePixmap(self.size())
 
     def setText(self, text):
+        """
+        Caller needs to call resizePixmap to update
+        """
         self.text = text
 
     def toggleFit(self):
@@ -999,7 +1039,9 @@ class ImageWidget(QLabel):
             font.setFamily("Courier")
             painter.setFont(font)
             painter.setPen(pen)
-            painter.drawText(QPoint(10, 18), self.text)
+            # XXX This wraps the text to the pixmap width, ideally it should
+            #     spill to the margins of the pixmap if there's room?
+            painter.drawText(pixmap.rect(), Qt.TextWrapAnywhere, self.text)
             painter.end()
 
         super(ImageWidget, self).setPixmap(pixmap)
@@ -1043,6 +1085,12 @@ class ImageViewer(QMainWindow):
         super(ImageViewer, self).__init__()
 
         self.slideshow_timer = None
+
+        self.animation_timer = None
+        self.animation_reader = None
+        # Initialize to 0 and 1 so statusbar displays 1/1 on non-animated files
+        self.animation_frame = 0
+        self.animation_count = 1
 
         self.recent_filepaths = []
 
@@ -1099,6 +1147,7 @@ class ImageViewer(QMainWindow):
         self.imageWidget.addAction(self.lastImageAct)
         self.imageWidget.addAction(self.prevImageAct)
         self.imageWidget.addAction(self.nextImageAct)
+        self.imageWidget.addAction(self.animationAct)
         self.imageWidget.addAction(self.slideshowAct)
         self.imageWidget.addAction(self.exitAct)
     
@@ -1181,7 +1230,10 @@ class ImageViewer(QMainWindow):
         filepath = None
         if (self.slideshow_timer is not None):
             self.slideshow_timer.stop()
-
+        
+        if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
+            self.animation_timer.stop()
+        
         # Remove prefetches that haven't been serviced yet to prevent prefetches
         # fighting for filesystem bandwidth with the filedialog list and stat
         # (note the prefetches in flight will still be serviced and put in the
@@ -1199,6 +1251,12 @@ class ImageViewer(QMainWindow):
             dlg = FileDialog(dirpath, self)
             if (dlg.exec_() == QDialog.Accepted):
                 filepath = dlg.chosenFilepath
+
+        # Restart the animation timer if it was running, if the new image is
+        # loaded and found not to have animations, the timer will be stopped
+        # there
+        if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
+            self.animation_timer.start(animation_interval_ms)
 
         if (self.slideshow_timer is not None):
             self.slideshow_timer.start(slideshow_interval_ms)
@@ -1324,8 +1382,21 @@ class ImageViewer(QMainWindow):
             # Drain the requests as they are satisfied until the requested one
             # is found. Note this won't be in order if there are more than one
             # prefetcher threads
+            
+            # XXX Sometimes the current image may be stuck behind a furure 
+            #     prefetch, investigate?
+            #     - Does this only happen when slideshow starts, or also in the
+            #       middle?
+            #     - Pause all prefetch threads but for the one servicing this
+            #       request? 
+            #     - Have a high priority prefetch thread?
+            #     - Prefetch block by block and pause when not high prio or
+            #       allow partial prefetches and switch to a hi prio prefetch?
+            #     - Use a heap queue?
             while (True):
+                info("Popping prefetch response queue for %r", filepath)
                 entry_filepath, entry_data = self.prefetch_response_queue.get()
+                info("Popped prefetch response queue %r for %r", entry_filepath, filepath)
                 
                 self.prefetch_pending.remove(entry_filepath)
 
@@ -1335,14 +1406,16 @@ class ImageViewer(QMainWindow):
                         self.cached_files.pop(-1)
                     info("inserting in cache %r", entry_filepath)
                     self.cached_files.insert(0, (entry_filepath, entry_data))
+                    info("inserted in cache %r", entry_filepath)
 
                 if (entry_filepath == filepath):
                     break
 
         return entry_data
             
-    def loadImage(self, filepath, index = None, count = None):
+    def loadImage(self, filepath, index = None, count = None, frame = None):
         info("loadImage %r %s %s", filepath, index, count)
+        info("Supported extensions %s", supported_extensions)
         assert isinstance(filepath, unicode) 
         if (filepath.lower().endswith(".lst")):
             lst_filepath = filepath
@@ -1371,11 +1444,23 @@ class ImageViewer(QMainWindow):
             self.image_index = 0
             index = 0
             count = len(filepaths)
+            self.image_index = 0
+            self.image_count = count
 
         else:
-            # If there's no index and count information, reset filenames cache
+            # If there's no index and count information and this is not a frame
+            # reset filenames cache
             if (index is None):
-                self.image_filepaths = None
+                # XXX Index and count passed as parameter is messy, should only
+                #     update the internal variables when needed?
+                if (frame is None):
+                    self.image_filepaths = None
+                    self.image_index = 0
+                    self.image_count = 1
+
+            else:
+                self.image_index = index
+                self.image_count = count
             
         # Update these early in case the image fails to load other filepaths can
         # still be cycled
@@ -1386,11 +1471,12 @@ class ImageViewer(QMainWindow):
             self.nextImageAct.setEnabled(True)
             self.slideshowAct.setEnabled(True)
 
-        info("QImaging %r", filepath)
+        info("Caching %r", filepath)
         self.statusBar().showMessage("Loading...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         data = self.getDataFromCache(filepath)
         QApplication.restoreOverrideCursor()
+        info("Cached %r", filepath)
         if (data is None):
             QMessageBox.information(self, "Image Viewer",
                     "Cannot load %s." % filepath)
@@ -1398,12 +1484,89 @@ class ImageViewer(QMainWindow):
 
         else:
 
+            info("QImaging %r", filepath)
             self.statusBar().showMessage("Converting...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
-            image = QImage.fromData(data)
+
+            # If this is not a sequential frame or there's no exising reader,
+            # create a new reader
+            if (
+                (self.animation_reader is None) or 
+                ((frame is None) or
+                 ((frame != (self.animation_frame + 1)) or
+                  (frame >= self.animation_reader.imageCount()))
+                )
+                ):
+
+                # This can be using a new reader because 
+                # 1) It's a new file
+                # 2) It requested an out of order frame (including the first frame)
+                info("Using new reader")
+
+                buffer = QBuffer()
+                buffer.setData(data)
+                buffer.open(QIODevice.ReadOnly)
+                reader = QImageReader(buffer)
+
+                if (reader.imageCount() > 1):
+                    # This image has animations and we are using a new reader,
+                    # initialize animation machinery
+                    if (self.animation_timer is None):
+                        timer = QTimer()
+                        timer.timeout.connect(self.nextFrame)
+                        timer.setSingleShot(True)
+                        self.animation_timer = timer
+
+                    elif (self.animationAct.isChecked()):
+                        self.animation_timer.stop()
+                    
+                    self.animation_report_time = 0.0
+                    self.animation_frame = 0
+                    self.animation_count = reader.imageCount()
+                    self.animation_reader = reader
+                    # This needs to be kept around or PyQt will crash
+                    self.animation_buffer = buffer
+
+                    if (frame is not None):
+                        # This is a non-sequential frame, advance as many frames
+                        # as necessary by reading, since QGIFHandler doesn't
+                        # support jumpToNextImage or jumpToImage 
+                        # See https://code.woboq.org/qt5/qtbase/src/plugins/imageformats/gif/qgifhandler.cpp.html
+                        frame = frame % reader.imageCount()
+                        for _ in xrange(frame-1):
+                            # QGIFHandler doesn't support jumpToNextImage or
+                            # jumpToImage, discard the frames sequentially
+                            reader.read()
+                        self.animation_frame = frame
+
+                elif (self.animation_reader is not None):
+                    # No animations in this image but the previous image had,
+                    # cleanup animation machinery
+                    assert frame is None
+                    self.animation_reader = None
+                    self.animation_buffer = None
+                    if (self.animationAct.isChecked()):
+                        self.animation_timer.stop()
+                    self.animation_timer = None
+                    self.animation_count = 1
+                    self.animation_frame = 0
+            
+            else:
+                info("Recycling reader")
+                reader = self.animation_reader
+                buffer = self.animation_buffer
+                self.animation_frame = frame
+            
+            info("frame %s/%d tell %d", frame, reader.imageCount(), buffer.pos())
+
+            image = reader.read()
+
+            if ((self.animation_timer is not None) and (self.animationAct.isChecked())):
+                self.animation_timer.start(animation_interval_ms)
+                    
             QApplication.restoreOverrideCursor()
             self.statusBar().clearMessage()
-            info("QImaged %r", filepath)
+            info("QImaged %r format %s", filepath, image.format())
         
             if (image.isNull()):
                 QMessageBox.information(self, "Image Viewer",
@@ -1419,18 +1582,20 @@ class ImageViewer(QMainWindow):
 
         self.image_filepath = filepath
         
-        self.setWindowTitle("Image Viewer - %s%s" % (
-            os.path.basename(filepath), 
-            "" if index is None else " [%d / %d]" % (index + 1, count)
-        ))
-        # XXX Do this only if fullscreen? (but it needs to be updated at
-        #     fullscreen toggle too, which requires proper storing of index and
-        #     count, and general file list cleanup)
-        self.imageWidget.setText("%s%s" % (filepath, "" if index is None else " [%d / %d]" % (index + 1, count) ))
+        pixmap = QPixmap.fromImage(image)
+        # Reset the scroll unless it's another frame of an animated image
+        if (frame is None):
+            self.imageWidget.scroll = 0
         # XXX Is this image to pixmap to setpixmap redundant? should we use image?
         #     or pixmap?
-        pixmap = QPixmap.fromImage(image)
         self.imageWidget.setPixmap(pixmap)
+
+        if (self.animation_count > 1):
+            new_report_time = time.time()
+            self.animation_fps = (1.0 / (new_report_time - self.animation_report_time))
+            self.animation_report_time = new_report_time
+
+        self.updateImage()
 
         info("Statusing")
         self.statusFilepath.setText(filepath)
@@ -1447,6 +1612,11 @@ class ImageViewer(QMainWindow):
         ))
 
         try:
+            # XXX This can stuck get behind prefetches, defer (note this is
+            #     already done before the next prefetch is requested in
+            #     gotoImage, so only remaining option to fix this is to defer)
+            # XXX This doesn't need refresh for the next frame of an animated
+            #     image, cache?
             filemtime = os.path.getmtime(filepath)
             
         except:
@@ -1455,11 +1625,37 @@ class ImageViewer(QMainWindow):
 
         filedate = datetime.datetime.fromtimestamp(filemtime)
         self.statusDate.setText("%s" % filedate.strftime("%Y-%m-%d %H:%M:%S"))
-        self.statusIndex.setText("%d / %d" % (1 if index is None else index + 1, 1 if count is None else count))
+        self.statusIndex.setText("%d / %d" % (self.image_index + 1, self.image_count))
         info("Statused")
 
         self.updateStatus()
         self.updateActions()
+
+    def updateImage(self, redraw=True):
+        info("updateImage")
+
+        # Display text information in fullscreen, in windowed mode this is in
+        # the statusbar
+        # XXX Do we need to tell the difference between image_count = 1 because
+        #     the directory hasn't been listed yet vs. the directory only
+        #     contains one image file?
+        s = "" if (self.image_count == 1) else " [%d / %d]" % (self.image_index + 1, self.image_count)
+        if (self.fullscreenAct.isChecked()):
+            if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
+                s += " %2.2f fps" % self.animation_fps
+            self.imageWidget.setText("%s%s" % (self.image_filepath, s))
+
+        else:
+            self.setWindowTitle("Image Viewer - %s%s" % (
+                os.path.basename(self.image_filepath), 
+                s
+            ))
+            
+            self.imageWidget.setText("")
+        
+        if (redraw):
+            self.imageWidget.resizePixmap(self.imageWidget.size())
+
 
     def updateStatus(self):
         info("updateStatus")
@@ -1474,14 +1670,30 @@ class ImageViewer(QMainWindow):
         else:
             zoom_factor = (pixmap_size.height() * 100) / orig_pixmap_size.height()
         
-        self.statusZoom.setText("%d%% %s %s %d deg" % (
+        self.statusZoom.setText("%d%% %s %s %d d %d/%d%s" % (
             zoom_factor,
             "S" if self.imageWidget.fitToSmallest else "L",
             "%2.1fg" % self.imageWidget.gamma,
-            self.imageWidget.rotation_degrees            
+            self.imageWidget.rotation_degrees,
+            self.animation_frame + 1,
+            self.animation_count, 
+            " %2.1f" % self.animation_fps if (self.animationAct.isEnabled() and self.animationAct.isChecked()) else ""
         ))
 
-
+    def animationToggled(self):
+        if (self.animationAct.isChecked()):
+            info("starting animation timer")
+            self.animation_timer.start(animation_interval_ms)
+            # fps indicator will be shown when the new frame is loaded
+        
+        else:
+            info("stopping animation timer")
+            self.animation_timer.stop()
+            # Refresh the status bar and image to remove the fps indicator
+            self.updateImage()
+            self.updateStatus()
+        
+        
     def slideshowToggled(self):
         if (self.slideshowAct.isChecked()):
             info("creating timer")
@@ -1515,6 +1727,8 @@ class ImageViewer(QMainWindow):
         #self.setWindowFlags(self.windowFlags() ^ Qt.FramelessWindowHint)
         # Needs showing after changing flags
         #self.show()
+
+        self.updateImage(False)
 
         if (self.fullscreenAct.isChecked()):
             info("starting fullscreen")
@@ -1662,6 +1876,11 @@ class ImageViewer(QMainWindow):
         
         return canvas_limit, pixmap_limit
 
+    def nextFrame(self):
+        info("nextFrame %d", self.animation_frame)
+        
+        self.loadImage(self.image_filepath, frame=self.animation_frame + 1)
+
     def prevImage(self):
         info("prevImage")
 
@@ -1678,7 +1897,7 @@ class ImageViewer(QMainWindow):
             self.imageWidget.scroll -= canvas_limit
             self.imageWidget.scroll = max(0, self.imageWidget.scroll)
             info("Scrolling to %d canvas limit %d pixmap limit %d", self.imageWidget.scroll, canvas_limit, pixmap_limit)
-            self.imageWidget.resizePixmap(self.imageWidget.size())
+            self.updateImage()
 
         else:
             self.gotoImage(-1)
@@ -1688,8 +1907,8 @@ class ImageViewer(QMainWindow):
             self.imageWidget.scroll = max(0, pixmap_limit - canvas_limit)
             # XXX this is redundant with the call in gotoImage but that one 
             #     has the wrong scroll value, fix?
-            self.imageWidget.resizePixmap(self.imageWidget.size())
-
+            self.updateImage()
+ 
     def nextImage(self):
         info("nextImage")
 
@@ -1706,7 +1925,7 @@ class ImageViewer(QMainWindow):
             self.imageWidget.scroll += canvas_limit
             self.imageWidget.scroll = min(self.imageWidget.scroll, pixmap_limit - canvas_limit)
             info("Scrolling to %d canvas limit %d pixmap limit %d", self.imageWidget.scroll, canvas_limit, pixmap_limit)
-            self.imageWidget.resizePixmap(self.imageWidget.size())
+            self.updateImage()
 
             # Restart the slideshow timer since there are no calls to gotoImage
             # that will do it
@@ -1716,8 +1935,8 @@ class ImageViewer(QMainWindow):
 
         else:
             # XXX Right now gotoImage will call loadImage which will reset
-            #     scroll, no need to do here until loadImage is fixed to not
-            #     reset it?
+            #     scroll when it calls setPixmap, no need to do here until
+            #     loadImage is fixed to not reset it?
             self.imageWidget.scroll = 0
             self.gotoImage(1)
 
@@ -1776,6 +1995,10 @@ class ImageViewer(QMainWindow):
         
         self.slideshowAct = QAction("Toggle Slidesho&w", self, shortcut="space", 
             checkable=True, enabled=False, triggered=self.slideshowToggled)
+
+        self.animationAct = QAction("Toggle &Animation", self, shortcut="A", 
+            checkable=True, enabled=False, triggered=self.animationToggled)
+        self.animationAct.setChecked(True)
         
         self.aboutAct = QAction("&About", self, triggered=self.about)
 
@@ -1810,6 +2033,9 @@ class ImageViewer(QMainWindow):
         self.viewMenu.addAction(self.nextImageAct)
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.slideshowAct)
+        self.viewMenu.addSeparator()
+        self.viewMenu.addAction(self.animationAct)
+
 
         self.helpMenu = QMenu("&Help", self)
         self.helpMenu.addAction(self.aboutAct)
@@ -1850,6 +2076,7 @@ class ImageViewer(QMainWindow):
         self.prevImageAct.setEnabled(True)
         self.nextImageAct.setEnabled(True)
         self.slideshowAct.setEnabled(True)
+        self.animationAct.setEnabled(self.animation_count > 1)
         self.fullscreenAct.setEnabled(True)
         
 
@@ -1878,6 +2105,7 @@ class ImageViewer(QMainWindow):
 
 logger = logging.getLogger(__name__)
 setup_logger(logger)
+#logger.setLevel(logging.WARNING)
 logger.setLevel(logging.INFO)
 
 if (__name__ == '__main__'):
