@@ -58,7 +58,6 @@ import time
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
-from PyQt5.QtPrintSupport import *
 
 class LineHandler(logging.StreamHandler):
     def __init__(self):
@@ -185,6 +184,8 @@ def os_path_abspath(path):
 # ['.bmp', '.dds', '.gif', '.icns', '.ico', '.jp2', '.jpeg', '.jpg', '.mng', 
 #  '.pbm', '.pgm', '.png', '.ppm', '.svg', '.svgz', '.tga', '.tif', '.tiff', 
 #  '.wbmp', '.webp', '.xbm', '.xpm']
+# XXX This causes Qt to load which forces to move Qt patching higher up, move
+#     inside Qt appp?
 image_extensions = [".%s" % fmt for fmt in QImageReader.supportedImageFormats()]
 supported_extensions = image_extensions + [".lst"]
 first_image = -float("inf")
@@ -1072,13 +1073,6 @@ class ImageWidget(QLabel):
             info("sizeHint %dx%d", width, height)
         
         return QSize(width, height)
-
-class VLine(QFrame):
-    # a simple VLine, like the one you get from designer
-    # See https://stackoverflow.com/questions/57943862/pyqt5-statusbar-separators
-    def __init__(self):
-        super(VLine, self).__init__()
-        self.setFrameShape(self.VLine|self.Sunken)
     
 class ImageViewer(QMainWindow):
     def __init__(self):
@@ -1472,7 +1466,7 @@ class ImageViewer(QMainWindow):
             self.slideshowAct.setEnabled(True)
 
         info("Caching %r", filepath)
-        self.statusBar().showMessage("Loading...")
+        self.showMessage("Loading...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         data = self.getDataFromCache(filepath)
         QApplication.restoreOverrideCursor()
@@ -1485,7 +1479,7 @@ class ImageViewer(QMainWindow):
         else:
 
             info("QImaging %r", filepath)
-            self.statusBar().showMessage("Converting...")
+            self.showMessage("Converting...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
 
             # If this is not a sequential frame or there's no exising reader,
@@ -1507,6 +1501,13 @@ class ImageViewer(QMainWindow):
                 buffer.setData(data)
                 buffer.open(QIODevice.ReadOnly)
                 reader = QImageReader(buffer)
+                # XXX Missing rotating images using the EXIF information
+                #     QImageReader.setAutoTransform is Qt 5.5, but 5.3.1 is the
+                #     one on pip Windows 10 
+                #     See https://stackoverflow.com/questions/15123340/qimage-loads-with-wrong-orientation-for-certain-images
+                #     Install from git instead of pip which has Qt 5.7.1? 
+                #     See https://github.com/pyqt/python-qt5
+                #     XP from Anaconda has Qt 5.6 and Linux from apt has Qt 5.11 
 
                 if (reader.imageCount() > 1):
                     # This image has animations and we are using a new reader,
@@ -1565,7 +1566,7 @@ class ImageViewer(QMainWindow):
                 self.animation_timer.start(animation_interval_ms)
                     
             QApplication.restoreOverrideCursor()
-            self.statusBar().clearMessage()
+            self.clearMessage()
             info("QImaged %r format %s", filepath, image.format())
         
             if (image.isNull()):
@@ -1585,6 +1586,8 @@ class ImageViewer(QMainWindow):
         pixmap = QPixmap.fromImage(image)
         # Reset the scroll unless it's another frame of an animated image
         if (frame is None):
+            # XXX Resetting the scroll here is probably redundant with other
+            #     places?
             self.imageWidget.scroll = 0
         # XXX Is this image to pixmap to setpixmap redundant? should we use image?
         #     or pixmap?
@@ -1656,6 +1659,15 @@ class ImageViewer(QMainWindow):
         if (redraw):
             self.imageWidget.resizePixmap(self.imageWidget.size())
 
+
+    def showMessage(self, msg, timeout_ms=0):
+        self.status_message_timer.stop()
+        self.status_message_widget.setText(msg)
+        if (timeout_ms > 0):
+            self.status_message_timer.start(timeout_ms)
+            
+    def clearMessage(self):
+        self.status_message_widget.setText("")
 
     def updateStatus(self):
         info("updateStatus")
@@ -1934,9 +1946,6 @@ class ImageViewer(QMainWindow):
                 self.slideshow_timer.start(slideshow_interval_ms)
 
         else:
-            # XXX Right now gotoImage will call loadImage which will reset
-            #     scroll when it calls setPixmap, no need to do here until
-            #     loadImage is fixed to not reset it?
             self.imageWidget.scroll = 0
             self.gotoImage(1)
 
@@ -2046,23 +2055,36 @@ class ImageViewer(QMainWindow):
         self.menuBar().addMenu(self.helpMenu)
 
     def createStatus(self):
-        self.statusBar().addPermanentWidget(VLine())
+        frame_style = QFrame.WinPanel | QFrame.Sunken
+
+        # Can't set sunken style on QStatusBar.showMessage, use a widget and
+        # reimplement showMessage and clearMessage
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(self.clearMessage)
+        self.status_message_timer = timer
+
+        self.status_message_widget = QLabel()
+        self.status_message_widget.setFrameStyle(frame_style)
+        self.statusBar().addWidget(self.status_message_widget, 1)
+
         self.statusFilepath = QLabel()
+        self.statusFilepath.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusFilepath)
-        self.statusBar().addPermanentWidget(VLine())
         self.statusResolution = QLabel()
+        self.statusResolution.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusResolution)
-        self.statusBar().addPermanentWidget(VLine())
         self.statusIndex = QLabel()
+        self.statusIndex.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusIndex)
-        self.statusBar().addPermanentWidget(VLine())
         self.statusZoom = QLabel()
+        self.statusZoom.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusZoom)
-        self.statusBar().addPermanentWidget(VLine())
         self.statusSize = QLabel()
+        self.statusSize.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusSize)
-        self.statusBar().addPermanentWidget(VLine())
         self.statusDate = QLabel()
+        self.statusDate.setFrameStyle(frame_style)
         self.statusBar().addPermanentWidget(self.statusDate)
         
     def updateActions(self):
@@ -2103,12 +2125,137 @@ class ImageViewer(QMainWindow):
         
         return super(ImageViewer, self).resizeEvent(event)
 
+def verify_pyqt5_installation():
+    # Anaconda 2.3.0 puts DLLs in pkgs/<module_version>/Library/bin folders but
+    # forgets to add them to the path and cannot later be found, include those
+    # in the path. Anaconda 2.2.0 doesn't have this issue
+    add_anaconda_dlls_to_path = False
+    if (add_anaconda_dlls_to_path):
+        pkgs_dir = R"c:\Anaconda\pkgs"
+        for pkg_dir in os.listdir(pkgs_dir):
+            pkg_filepath = os.path.join(pkgs_dir, pkg_dir)
+            library_bin_path = os.path.join(pkg_filepath, "Library", "bin")
+            if (os.path.exists(library_bin_path )) and not pkg_dir.startswith("sqlite"):
+                info("adding DLL library path %s", library_bin_path)
+                os.environ["PATH"] = library_bin_path + ";" + os.environ["PATH"]
+
+    # Anaconda 2.2.0 and 2.3.0 fail to set QT_PLUGIN_PATH giving the error
+    # "couldn't find or load qt platform plugin "windows"
+    # See https://github.com/ContinuumIO/anaconda-issues/issues/1270
+    # See https://github.com/pyqt/python-qt5/issues/2
+    # See https://github.com/ContinuumIO/anaconda-issues/issues/1270
+    # See https://github.com/pyqt/python-qt5/wiki/Qt-Environment-Variable-Reference#qt-plugin-path
+    # See https://github.com/pyqt/python-qt5/blob/master/qt.conf
+    # See https://stackoverflow.com/questions/51286721/changing-qt-plugin-path-in-environment-variables-causes-programs-to-fail
+    # On 64-bit python-qt5 pip installs, this is properly set to
+    #   C:\Python27\lib\site-packages\PyQt5\plugins 
+    # when C:\Python27\Lib\site-packages\PyQt5\__init__.py runs since this commit
+    # https://github.com/pyqt/python-qt5/blob/06ce5b1d1909929130ee0cc8b53e0199d92cbcfd/PyQt5/__init__.py
+    # until this commit that updates to Qt 5.4
+    # https://github.com/pyqt/python-qt5/blob/93b127adc95e681ea87abd9ab5e66a0e299fce19/PyQt5/__init__.py
+    # which moves qt.conf generation to setup.py
+    # It also ships a proper C:\Python27\Lib\site-packages\PyQt5\qt.conf
+    # which contains the entries
+    #   Prefix = C:/Python27/Lib/site-packages/PyQt5
+    #   Binaries = C:/Python27/Lib/site-packages/PyQt5
+    # (a specific entry Plugins is also allowed, default is "plugins", see
+    # https://doc.qt.io/qt-6/qt-conf.html)
+    # But Anaconda 2.2.0 only has Qt4 qt.conf around 
+    #   C:\Anaconda\Lib\site-packages\PyQt4\qt.conf
+    #   C:\Anaconda\qt.conf
+    # With the entries
+    #   [Paths]
+    #   Prefix = ./Lib/site-packages/PyQt4
+    #   Binaries = ./Lib/site-packages/PyQt4
+    # And C:\Anaconda\pkgs\pyqt-5.6.0-py27_2\Lib\site-packages\PyQt5\__init__.py
+    # is empty.
+    # In addition, a python-qt5 anaconda installation doesn't have neither DLLs in 
+    # path nor a plugin subdir but in C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library
+    # in that path, instead that one is on 
+    # C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library\bin\Qt5Gui.dll
+    # XXX This path will probably change with anaconda qt updates, not clear the
+    #     best way of getting this, probably move to a conda batch file?
+    # XXX This needs to be set before any Qt usage, but can be set after the imports
+    
+    # Anaconda 2.2.0 and 2.3.0 (the last versions that are known to work on
+    # 32-bit Windows XP) fail to install Qt properly: don't set QT_PLUGIN_PATH
+    # nor provide a qt.conf file. 
+    #
+    # Those Anacondas require QT_PLUGIN_PATH to be set manually before running
+    # the app. Note this is an Anaconda-specific problem, other environments
+    # either set QT_PLUGIN_PATH (eg 64-bit Windows 10 PyQt5 5.3.2 installed from
+    # pip) or provide qt.conf (eg Linux PyQt 5.11.3 installed from pip) or both.
+    needs_qt_plugin_path = (" 32 bit " in sys.version) and  ("|Continuum Analytics, Inc.|" in sys.version)
+    if (needs_qt_plugin_path and ("QT_PLUGIN_PATH" not in os.environ)):
+        # XXX Note that QT_PLUGIN_PATH set is not necessary for PyQt5 to work,
+        #     eg Linux PyQt 5.11.3 doesn't set it but it works (and setting one
+        #     gets ignored when the first QApplication is created)
+        #os.environ["QT_PLUGIN_PATH"] = R"C:\Anaconda\pkgs\qt-5.6.2-vc9_6\Library\plugins"
+        raise Exception("QT_PLUGIN_PATH not set but conda Python found \"%s\"\n"
+            "Qt applications will fail with \"couldn't find or load qt platform plugin \"windows\"\"\n"
+            "Set QT_PLUGIN_PATH to point to Qt plugins before running the application, eg\n"
+            "SET QT_PLUGIN_PATH C:\\Anaconda\\pkgs\\qt-5.6.2-vc9_6\\Library\\plugins\n" % sys.version)
+
+
+def report_versions():
+    info("Python version: %s", sys.version)
+
+    # Numpy is only needed to apply gamma correction
+    np_version = "Not installed"
+    try:
+        import numpy as np
+        np_version = np.__version__
+        
+    except:
+        warn("numpy not installed, image filters disabled")
+    info("Numpy version: %s", np_version)
+    
+
+    info("Qt version: %s", QT_VERSION_STR)
+    info("PyQt version: %s", PYQT_VERSION_STR)
+
+    pyqt5_sqlite_version = "Not installed"
+    pyqt5_sqlite_compile_options = []
+    try:
+        from PyQt5.QtSql import QSqlDatabase
+        db = QSqlDatabase.addDatabase("QSQLITE")
+        db.open()
+        query = db.exec_("SELECT sqlite_version();")
+        query.first()
+        pyqt5_sqlite_version = query.value(0)
+
+        query = db.exec_("PRAGMA compile_options;")
+        while (query.next()):
+            pyqt5_sqlite_compile_options.append(query.value(0))
+        db.close()
+    
+    except:
+        # On Linux QtSql import is known to fail when python-pyqt5.qtsql is not
+        # installed, needs 
+        #   apt install python-pyqt5.qtsql 
+        pass
+        
+    info("QSQLITE version: %s", pyqt5_sqlite_version)
+    info("QSQLITE compile options: %s", pyqt5_sqlite_compile_options)
+    info("Qt plugin path: %s", os.environ.get("QT_PLUGIN_PATH", "Not set"))
+    info("QCoreApplication.libraryPaths: %s", QCoreApplication.libraryPaths())
+    info("QLibraryInfo.PrefixPath: %s", QLibraryInfo.location(QLibraryInfo.PrefixPath))
+    info("QLibraryInfo.PluginsPath: %s", QLibraryInfo.location(QLibraryInfo.PluginsPath))
+    info("QLibraryInfo.LibrariesPath: %s", QLibraryInfo.location(QLibraryInfo.LibrariesPath))
+    info("QLibraryInfo.LibrarieExecutablesPath: %s", QLibraryInfo.location(QLibraryInfo.LibraryExecutablesPath))
+    info("QLibraryInfo.BinariesPath: %s", QLibraryInfo.location(QLibraryInfo.BinariesPath))
+
+
 logger = logging.getLogger(__name__)
 setup_logger(logger)
 #logger.setLevel(logging.WARNING)
 logger.setLevel(logging.INFO)
 
 if (__name__ == '__main__'):
+    report_versions()
+    
+    verify_pyqt5_installation()
+    
     app = QApplication(sys.argv)
     imageViewer = ImageViewer()
     imageViewer.show()

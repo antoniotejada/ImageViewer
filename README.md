@@ -6,16 +6,45 @@ and on low power computers like Raspberry Pi 2
 ## Screenshots
 
 
-### Windows 10
+### 64-bit Windows 10
 
-![imageviewer_pc](https://user-images.githubusercontent.com/6446344/180907186-7ca0b477-e825-4fec-ab0a-366642303f27.jpg)
+![imageviewer_win10](https://user-images.githubusercontent.com/6446344/180907186-7ca0b477-e825-4fec-ab0a-366642303f27.jpg)
 *[Castle Defence &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
-### Raspberry Pi LXDE 
+### 32-bit Windows XP
+
+![imageviewer_winxp](https://user-images.githubusercontent.com/6446344/186052508-8ff7e543-dde4-403f-8b92-1822549ce9e2.png)
+*[Castle Defence &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
+
+### 32-bit Raspberry Pi LXDE 
 
 ![imageviewer_rpi](https://user-images.githubusercontent.com/6446344/180907188-552fde3e-21d2-4cd9-9e68-652795706eef.jpg)
 *[Castle Defence &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
+
+## Installing
+
+### 32-bit Raspberry OS
+
+1. Install Python 2.7
+1. sudo apt install python-pyqt5 (pip install python-qt5 fails with missing egg-info)
+
+### 64-bit Windows 10
+
+1. Install Python 2.7
+1. pip install python-qt5 (or follow https://github.com/pyqt/python-qt5)
+
+### 32-bit Windows XP
+
+python-qt5 is a 64-bit Windows project so it doesn't work in 32-bit Windows XP,
+fortunately some versions of Anaconda do support PyQt5 and 32-bit Windows XP.
+
+1. Install Anaconda 2.2.0 which is the last Anaconda Python 2.7.x version that
+   is known to work on XP (2.3.0 also seems to work, but has missing DLL paths
+   at runtime). This will install Python 2.7.9
+1. Create a conda python 2.7 environment, this will install Python 2.7.13 in
+   that environment.
+1. conda install PyQt5
 
 ## Running
 
@@ -39,8 +68,8 @@ and on low power computers like Raspberry Pi 2
 
 ## Features
 - Uses PyQt5 and Python 2.7
-- Works on Raspberry Pi 2 with LXDE
-- Works on Windows
+- Works on 32-bit Raspberry Pi 2 with LXDE
+- Works on 64-bit Windows 10, 32-bit Windows XP
 - Loads Qt-supported images (currently PyQt5 reports support for .bmp, .dds,
   .gif, .icns, .ico, .jp2, .jpeg, .jpg, .mng, .pbm, .pgm, .png, .ppm, .svg,
   .svgz, .tga, .tif, .tiff, .wbmp, .webp, .xbm, .xpm)
