@@ -94,6 +94,7 @@ fortunately some versions of Anaconda do support PyQt5 and 32-bit Windows XP.
   next/previous image, middle click to start/stop slideshow)
 - Copy / paste image path from clipboard
 - Paste newline-separated paths as slideshow contents
+- Background color cycling
 
 ## Requirements
 - Python 2.7

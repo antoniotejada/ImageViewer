@@ -49,6 +49,7 @@ import datetime
 import logging
 import os
 import Queue as queue
+import re
 import stat
 import string
 import sys
@@ -253,16 +254,47 @@ def prefetch_files(request_queue, response_queue):
         #   footprint
         # - Doing QImage conversion on the GUI thread is not that taxing and
         #   doesn't stall for long
+        #
+        # Also store the file stat otherwise os.stat calls in the main thread
+        # get queued behind data requests, taking seconds, making the prefetch
+        # useless
         try:
-            with open(filepath, "rb") as f:
+            # Caller expects the original filepath in the reply (specifically,
+            # to use as the cache key), don't modify it
+            long_filepath = filepath
+            # On Windows open fails with > MAX_PATH filenames, needs to use
+            # unicode and \\?\ prefix, \\?\UNC\ for network paths
+            #
+            # See https://stackoverflow.com/a/60105517
+            if (sys.platform.startswith("win")):
+                # Relative paths are always limited to MAX_PATH, see
+                # https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
+                # but all paths should go through os_path_abspath before getting
+                # here 
+                assert os.path.isabs(long_filepath), "Expected absolute path, got %r" % long_filepath
+
+                if (long_filepath.startswith(r"\\")):
+                    long_filepath = u'\\\\?\\UNC' + long_filepath[1:]
+                else:
+                    long_filepath = u'\\\\?\\' + long_filepath
+
+            t = time.time()
+            with open(long_filepath, "rb") as f:
                 data = f.read()
+            t = time.time() - t
+            info("worker prefetched data in %0.2fs %0.2fKB/s %r", t, len(data) / (t * 1024.0) if t > 0 else 0, long_filepath)
+            t = time.time()
+            filestat = os.stat(long_filepath)
+            t = time.time() - t
+            info("worker prefetched stat in %0.2fs %r", t, long_filepath)
         except:
             # If there was an error, let the caller handle it by placing None
             # data
-            exc("Unable to prefetch %r", filepath)
+            exc("Unable to prefetch %r", long_filepath)
             data = None
-        info("worker prefetched %r", filepath)
-        response_queue.put((filepath, data))
+            filestat = None
+        
+        response_queue.put((filepath, (data, filestat)))
 
     info("prefetch_files ends")
 
@@ -295,6 +327,16 @@ def split_base_index(s):
             base = s[:i-1]
             i -= 1
 
+    if (index is None):
+        # Try parenthesis
+        m = re.search(r"\((\d+)\)", s)
+        if (m is not None):
+            index = int(m.group(1))
+            if (m.start() > 0):
+                base = s[:m.start()]
+            else:
+                base = s[m.end():]
+            
     return base, index
 
 def cmp_numerically(a, b):
@@ -911,10 +953,8 @@ class ImageWidget(QLabel):
         super(ImageWidget, self).__init__(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(1, 1)
-        pal = self.palette()
-        pal.setColor(QPalette.Background, Qt.black)
         self.setAutoFillBackground(True)
-        self.setPalette(pal)
+        self.setBackgroundColor(Qt.darkGray)
         
         self.originalPixmap = None
         self.text = None
@@ -935,12 +975,23 @@ class ImageWidget(QLabel):
         """
         self.text = text
 
+    def setBackgroundColor(self, color):
+        self.backgroundColor = color
+
+        pal = self.palette()
+        pal.setColor(QPalette.Background, self.backgroundColor)
+        # palette() seems to be a copy, need to set the palette back for the
+        # change to take effect
+        pal = self.setPalette(pal)
+        
     def toggleFit(self):
         self.fitToSmallest = not self.fitToSmallest
         self.scroll = 0
         self.resizePixmap(self.size())
 
     def rotatePixmap(self, degrees):
+        # XXX Have a -1 or > 360 rotation that rotates dynamically so it takes
+        #     the most space?
         info("rotatePixmap from %d to %d", self.rotation_degrees, degrees)
         self.rotation_degrees = degrees
         self.scroll = 0
@@ -962,7 +1013,7 @@ class ImageWidget(QLabel):
 
         if (self.gamma != 1.0):
             # XXX This is not very efficient, conversions from pixmap to image
-            #     and back and done every time and at the original image size,
+            #     and back are done every time and at the original image size,
             #     should probably be cached and merged with the scaling/rotating
             #     below? (still takes only 20ms time on laptop)
             #     Also, .scaled does that conversion from QPixmap to QImage and back
@@ -1101,6 +1152,9 @@ class ImageViewer(QMainWindow):
         #     like there shouldn't be any even if the current is evicted from
         #     lur since the current is also kept separately? (although prefetch
         #     > cache is probably silly)
+        # XXX The "browse direction" cache should be larger than the opposite
+        #     direction cache? (eg have more files forward if browsing forward)
+        #     otherwise the cache is halved with typical forward browsing
         self.prefetched_images_max_count = 10
         self.prefetch_pending = set()
         self.prefetcher_count = (self.prefetched_images_max_count / 2) + 1
@@ -1340,6 +1394,7 @@ class ImageViewer(QMainWindow):
         #     contents, is there a way of copying multiple MIME types to the
         #     clipboard?
         #     clipboard.setPixmap(self.imageWidget.originalPixmap)
+        #     See https://www.qtcentre.org/threads/39887-QMimeData-using-setText-and-setUrls-at-the-same-time
         
 
     def getDataFromCache(self, filepath):
@@ -1429,6 +1484,10 @@ class ImageViewer(QMainWindow):
                 return
             
             filepaths = [unicode(filepath.strip()) for filepath in filepaths]
+            # XXX This should also allow lst files containing directories? What
+            #     files to include? allow wildcards (multiple wildcards could be
+            #     done by replicating the entry)? include all and let the
+            #     program fail to load whatever wrong file?
             for i, filepath in enumerate(filepaths):
                 if (not os.path.isabs(filepath)):
                     filepaths[i] = os.path.join(os.path.dirname(lst_filepath), filepath)
@@ -1475,8 +1534,9 @@ class ImageViewer(QMainWindow):
             QMessageBox.information(self, "Image Viewer",
                     "Cannot load %s." % filepath)
             image = None
-
+            
         else:
+            file_data, file_stat = data
 
             info("QImaging %r", filepath)
             self.showMessage("Converting...")
@@ -1498,7 +1558,7 @@ class ImageViewer(QMainWindow):
                 info("Using new reader")
 
                 buffer = QBuffer()
-                buffer.setData(data)
+                buffer.setData(file_data)
                 buffer.open(QIODevice.ReadOnly)
                 reader = QImageReader(buffer)
                 # XXX Missing rotating images using the EXIF information
@@ -1579,7 +1639,9 @@ class ImageViewer(QMainWindow):
             # exceptions everywhere when an invalid file is encountered
             # (prev/next navigation, etc)
             image = QImage(10, 10, QImage.Format_RGB32)
-            image.fill(Qt.black)
+            image.fill(self.imageWidget.backgroundColor)
+            file_data = []
+            file_stat = None
 
         self.image_filepath = filepath
         
@@ -1604,29 +1666,18 @@ class ImageViewer(QMainWindow):
         self.statusFilepath.setText(filepath)
         self.statusResolution.setText("%d x %d x %d BPP" % (image.size().width(), image.size().height(), image.depth()))
         self.statusSize.setText("%s / %s (%s)" % (
-            size_to_human_friendly_units(len(data) if data is not None else 0), 
+            size_to_human_friendly_units(len(file_data)), 
             size_to_human_friendly_units(image.byteCount()),
             size_to_human_friendly_units(
-                sum([len(entry_data) for entry_filepath, entry_data in self.cached_files]) + 
-                # XXX These getsize cause a noticeable stall
+                sum([(0 if entry_file_data is None else len(entry_file_data)) for entry_filepath, (entry_file_data, entry_file_stat) in self.cached_files]) + 
+                # XXX These getsize cause a noticeable stall, and they are not
+                #     cached yet so can't be obtained from the cache
                 # sum([os.path.getsize(entry_filepath) for entry_filepath in self.prefetch_pending])
                 0
                 )
         ))
 
-        try:
-            # XXX This can stuck get behind prefetches, defer (note this is
-            #     already done before the next prefetch is requested in
-            #     gotoImage, so only remaining option to fix this is to defer)
-            # XXX This doesn't need refresh for the next frame of an animated
-            #     image, cache?
-            filemtime = os.path.getmtime(filepath)
-            
-        except:
-            exc("Unable to get the filetime for %s", filepath)
-            filemtime = 0
-
-        filedate = datetime.datetime.fromtimestamp(filemtime)
+        filedate = datetime.datetime.fromtimestamp(0 if file_stat is None else file_stat.st_mtime)
         self.statusDate.setText("%s" % filedate.strftime("%Y-%m-%d %H:%M:%S"))
         self.statusIndex.setText("%d / %d" % (self.image_index + 1, self.image_count))
         info("Statused")
@@ -1705,6 +1756,13 @@ class ImageViewer(QMainWindow):
             self.updateImage()
             self.updateStatus()
         
+    def cycleBackgroundColor(self, forward=True):
+        backgroundColors = [Qt.white, Qt.lightGray, Qt.gray, Qt.darkGray, Qt.green, Qt.red, Qt.blue, Qt.magenta, Qt.cyan, Qt.black ]
+        assert self.imageWidget.backgroundColor in backgroundColors
+        delta = 1 if forward else -1
+        color = backgroundColors[(backgroundColors.index(self.imageWidget.backgroundColor) + delta + len(backgroundColors)) % len(backgroundColors)]
+        info("Setting background color to %s", QColor(color).name())
+        self.imageWidget.setBackgroundColor(color)
         
     def slideshowToggled(self):
         if (self.slideshowAct.isChecked()):
@@ -1726,8 +1784,9 @@ class ImageViewer(QMainWindow):
             self.slideshow_timer.stop()
             self.slideshow_timer = None
 
-
     def gammaCorrectionToggled(self):
+        # XXX Allow increment/decrement or several values and cycle through them
+        #     like it's done with background colors
         if (self.gammaCorrectAct.isChecked()):
             self.imageWidget.gammaCorrectPixmap(2.2)
         else:
@@ -1778,6 +1837,7 @@ class ImageViewer(QMainWindow):
             except:
                 # This can fail if the host is down or if the path is invalid,
                 # in that case return empty filenames
+                warn("Error listing dir %r", image_dirname)
                 filenames = []
             QApplication.restoreOverrideCursor()
             info("listed %r", image_dirname)
@@ -1794,6 +1854,11 @@ class ImageViewer(QMainWindow):
             self.image_filepaths = filepaths
 
         else:
+            # XXX If filepath is a directory here, replace and insert the
+            #     contents in filepaths? (eg if the program was opened with a
+            #     path as argument or if a path was found in the .lst file).
+            #     Will need to take care of setting the index at the beginning
+            #     or end of the inserted list depending on delta
             filepaths = self.image_filepaths
         
         filepath = None
@@ -1830,9 +1895,9 @@ class ImageViewer(QMainWindow):
             # prefetched
             
             # Start with the current index, then leapfrog between the next
-            # forward and backward prefetching (but note that images will be
-            # returned out of order anyway if there are multiple prefetch
-            # threads)
+            # forward and backward prefetching (this prefetches out of order wrt
+            # delta, but note that images will be returned out of order anyway
+            # if there are multiple prefetch threads)
             delta = 1
             for _ in xrange(self.prefetched_images_max_count):
                 filepath = filepaths[(i + delta + len(filepaths)) % len(filepaths)]
@@ -1989,6 +2054,11 @@ class ImageViewer(QMainWindow):
 
         self.fullscreenAct = QAction("&Fullscreen", self, enabled=False,
             checkable=True, shortcut="return", triggered=self.fullscreenToggled)
+
+        self.nextBackgroundColorAct = QAction("Next &Background Color", self,
+            shortcut="B", triggered=lambda : self.cycleBackgroundColor(True))
+        self.prevBackgroundColorAct = QAction("Previous Background Color", self,
+            shortcut="Shift+B", triggered=lambda : self.cycleBackgroundColor(False))
         
         self.firstImageAct = QAction("Fi&rst Image", self, shortcut="up", 
             enabled=False, triggered=self.firstImage)
@@ -2033,6 +2103,9 @@ class ImageViewer(QMainWindow):
         self.viewMenu.addAction(self.rotateRightAct)
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.gammaCorrectAct)
+        self.viewMenu.addSeparator()
+        self.viewMenu.addAction(self.prevBackgroundColorAct)
+        self.viewMenu.addAction(self.nextBackgroundColorAct)
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.fullscreenAct)
         self.viewMenu.addSeparator()
@@ -2100,6 +2173,8 @@ class ImageViewer(QMainWindow):
         self.slideshowAct.setEnabled(True)
         self.animationAct.setEnabled(self.animation_count > 1)
         self.fullscreenAct.setEnabled(True)
+        self.nextBackgroundColorAct.setEnabled(True)
+        self.prevBackgroundColorAct.setEnabled(True)
         
 
     def wheelEvent(self, event):
