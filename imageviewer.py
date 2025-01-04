@@ -159,6 +159,29 @@ def os_path_abspath(path):
     return abspath
 
 
+def os_path_safelong(filepath):
+    # On Windows open fails with > MAX_PATH filenames, needs to use unicode and
+    # \\?\ prefix, \\?\UNC\ for network paths
+    #
+    # See https://stackoverflow.com/a/60105517
+
+    long_filepath = unicode(filepath)
+    if (sys.platform.startswith("win")):
+        # Relative paths are always limited to MAX_PATH, see
+        # https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
+        # convert to absolute since paths reaching here are not. This has the
+        # added benefit of resolving . and .. also which fail when using the \\?
+        # long filename prefix
+        long_filepath = os_path_abspath(long_filepath)
+
+        if (long_filepath.startswith(r"\\")):
+            long_filepath = u'\\\\?\\UNC' + long_filepath[1:]
+        else:
+            long_filepath = u'\\\\?\\' + long_filepath
+            
+    return long_filepath
+
+
 # XXX Support animations via QMovie of a local temp file or QImageReader of
 #     QBuffer/QIODevice of a python buffer in the file cache, to avoid PyQt
 #     locking the UI thread
@@ -261,23 +284,8 @@ def prefetch_files(request_queue, response_queue):
         try:
             # Caller expects the original filepath in the reply (specifically,
             # to use as the cache key), don't modify it
-            long_filepath = filepath
-            # On Windows open fails with > MAX_PATH filenames, needs to use
-            # unicode and \\?\ prefix, \\?\UNC\ for network paths
-            #
-            # See https://stackoverflow.com/a/60105517
-            if (sys.platform.startswith("win")):
-                # Relative paths are always limited to MAX_PATH, see
-                # https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
-                # but all paths should go through os_path_abspath before getting
-                # here 
-                assert os.path.isabs(long_filepath), "Expected absolute path, got %r" % long_filepath
-
-                if (long_filepath.startswith(r"\\")):
-                    long_filepath = u'\\\\?\\UNC' + long_filepath[1:]
-                else:
-                    long_filepath = u'\\\\?\\' + long_filepath
-
+            long_filepath = os_path_safelong(filepath)
+            
             t = time.time()
             with open(long_filepath, "rb") as f:
                 data = f.read()
@@ -1469,14 +1477,15 @@ class ImageViewer(QMainWindow):
         if (filepath.lower().endswith(".lst")):
             lst_filepath = filepath
             filepaths = []
+            long_filepath = os_path_safelong(lst_filepath)
             try:
-                info("loading lst file %r", lst_filepath)
-                with open(lst_filepath, "r") as f:
+                info("loading lst file %r", long_filepath)
+                with open(long_filepath, "r") as f:
                     filepaths = f.readlines()
-                info("loaded lst file %r", lst_filepath)
+                info("loaded lst file %r", long_filepath)
 
             except:
-                exc("Unable to read %s", lst_filepath)
+                exc("Unable to read %s", long_filepath)
             
             if (len(filepaths) == 0):
                 QMessageBox.information(self, "Image Viewer",
@@ -1491,7 +1500,7 @@ class ImageViewer(QMainWindow):
             for i, filepath in enumerate(filepaths):
                 if (not os.path.isabs(filepath)):
                     filepaths[i] = os.path.join(os.path.dirname(lst_filepath), filepath)
-                
+
             filepath = filepaths[0]
             self.image_filepaths = filepaths
             self.image_index = 0
