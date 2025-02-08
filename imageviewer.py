@@ -1188,25 +1188,6 @@ class ImageViewer(QMainWindow):
         self.createActions()
         self.createMenus()
         self.createStatus()
-
-        # It's necessary to add the actions to the widget because in fullscreen
-        # mode there's no menubar to handle them
-        self.imageWidget.addAction(self.openAct)
-        self.imageWidget.addAction(self.openFromClipboardAct)
-        self.imageWidget.addAction(self.copyToClipboardAct)
-        self.imageWidget.addAction(self.toggleFitAct)
-        self.imageWidget.addAction(self.rotateLeftAct)
-        self.imageWidget.addAction(self.rotateRightAct)
-        self.imageWidget.addAction(self.gammaCorrectAct)
-        self.imageWidget.addAction(self.fullscreenAct)
-        self.imageWidget.addAction(self.firstImageAct)
-        self.imageWidget.addAction(self.lastImageAct)
-        self.imageWidget.addAction(self.prevImageAct)
-        self.imageWidget.addAction(self.nextImageAct)
-        self.imageWidget.addAction(self.animationAct)
-        self.imageWidget.addAction(self.slideshowAct)
-        self.imageWidget.addAction(self.exitAct)
-    
         
         self.setWindowTitle("Image Viewer")
         if (len(sys.argv) > 1):
@@ -1927,6 +1908,8 @@ class ImageViewer(QMainWindow):
     def toggleFit(self):
         self.imageWidget.toggleFit()
         self.scroll = 0
+        # XXX This should toggle between fit to largest, fit to smallest and
+        #     original size? (but original size may need scrolling support)
         if (self.imageWidget.fitToSmallest):
             self.toggleFitAct.setText("&Fit To Largest")
 
@@ -2028,17 +2011,31 @@ class ImageViewer(QMainWindow):
                 "<p>Simple no-frills <b>Image Viewer</b> optimized for high latency network drives</p>")
 
     def createActions(self):
-        self.openAct = QAction("&Open...", self, shortcut="O",
-            triggered=self.open)
+        def createGlobalAction(title, triggered, shortcut, checkable=False, enabled=True):
+            # Note shortcut parameter is compulsory since global actions need to
+            # be able to be called when there's no menubar
+            action = QAction(title, self, shortcut=shortcut, triggered=triggered, enabled=enabled, checkable=checkable)
+            
+            # It's necessary to add the actions to the widget because in
+            # fullscreen mode there's no menubar to route them
+            
+            # XXX This assumes the imageWidget has already been created and it's
+            #     the main widget, a widget-agnostic option would be to use
+            #     QSortcut?
+            #       QShortcut(action.shortcut(), self, action.trigger)
+            self.imageWidget.addAction(action)
 
-        self.openFromClipboardAct = QAction("O&pen From Clipboard", self, shortcut="Ctrl+V",
+            return action
+
+        self.openAct = createGlobalAction("&Open...", shortcut="O", triggered=self.open)
+
+        self.openFromClipboardAct = createGlobalAction("O&pen From Clipboard", shortcut="Ctrl+V",
             triggered=self.openFromClipboard)
 
-        self.copyToClipboardAct = QAction("&Copy To Cli&pboard", self, enabled=False, 
+        self.copyToClipboardAct = createGlobalAction("&Copy To Cli&pboard", enabled=False, 
             shortcut="Ctrl+C", triggered=self.copyToClipboard)
 
-        self.exitAct = QAction("E&xit", self, shortcut="esc",
-                triggered=self.close)
+        self.exitAct = createGlobalAction("E&xit", shortcut="esc", triggered=self.close)
 
         self.recentFileActs = []
         for i in range(most_recently_used_max_count):
@@ -2050,41 +2047,41 @@ class ImageViewer(QMainWindow):
         # XXX Support arbitrary scrolling
         # XXX Support arbitrary zooming
         
-        self.toggleFitAct = QAction("&Fit To Smallest", self, enabled=False, 
+        self.toggleFitAct = createGlobalAction("&Fit To Smallest", enabled=False, 
             shortcut="F", triggered=lambda : self.toggleFit())
         
-        self.rotateRightAct = QAction("Rotate Ri&ght", self, enabled=False, 
+        self.rotateRightAct = createGlobalAction("Rotate Ri&ght", enabled=False, 
             shortcut="R", triggered=lambda : self.rotateImage(90))
-        self.rotateLeftAct = QAction("Rotate &Left", self, enabled=False, 
+        self.rotateLeftAct = createGlobalAction("Rotate &Left", enabled=False, 
             shortcut="Shift+R", triggered=lambda : self.rotateImage(-90))
 
-        self.gammaCorrectAct = QAction("&Gamma Correct", self, enabled=False, 
+        self.gammaCorrectAct = createGlobalAction("&Gamma Correct", enabled=False, 
             checkable=True, shortcut="G", triggered=self.gammaCorrectionToggled)
 
-        self.fullscreenAct = QAction("&Fullscreen", self, enabled=False,
+        self.fullscreenAct = createGlobalAction("&Fullscreen", enabled=False,
             checkable=True, shortcut="return", triggered=self.fullscreenToggled)
 
-        self.nextBackgroundColorAct = QAction("Next &Background Color", self,
+        self.nextBackgroundColorAct = createGlobalAction("Next &Background Color", 
             shortcut="B", triggered=lambda : self.cycleBackgroundColor(True))
-        self.prevBackgroundColorAct = QAction("Previous Background Color", self,
+        self.prevBackgroundColorAct = createGlobalAction("Previous Background Color",
             shortcut="Shift+B", triggered=lambda : self.cycleBackgroundColor(False))
         
-        self.firstImageAct = QAction("Fi&rst Image", self, shortcut="up", 
+        self.firstImageAct = createGlobalAction("Fi&rst Image", shortcut="up", 
             enabled=False, triggered=self.firstImage)
 
-        self.lastImageAct = QAction("&Last Image", self, shortcut="down", 
+        self.lastImageAct = createGlobalAction("&Last Image", shortcut="down", 
             enabled=False, triggered=self.lastImage)
 
-        self.prevImageAct = QAction("&Previous Image", self, shortcut="left", 
+        self.prevImageAct = createGlobalAction("&Previous Image", shortcut="left", 
             enabled=False, triggered=self.prevImage)
 
-        self.nextImageAct = QAction("&Next Image", self, shortcut="right", 
+        self.nextImageAct = createGlobalAction("&Next Image", shortcut="right", 
             enabled=False, triggered=self.nextImage)
         
-        self.slideshowAct = QAction("Toggle Slidesho&w", self, shortcut="space", 
+        self.slideshowAct = createGlobalAction("Toggle Slidesho&w", shortcut="space", 
             checkable=True, enabled=False, triggered=self.slideshowToggled)
 
-        self.animationAct = QAction("Toggle &Animation", self, shortcut="A", 
+        self.animationAct = createGlobalAction("Toggle &Animation", shortcut="A", 
             checkable=True, enabled=False, triggered=self.animationToggled)
         self.animationAct.setChecked(True)
         
