@@ -5,6 +5,10 @@ and on low power computers like Raspberry Pi 2
 
 ## Screenshots
 
+### Image and Thumbnails
+
+![thumbnails](https://github.com/user-attachments/assets/855882aa-f9a8-4f69-bd95-7c49abd0d071)
+*[Castle Defence &copy; Greg Rutkowski](https://www.artstation.com/artwork/k4lYqK)*
 
 ### 64-bit Windows 10
 
@@ -95,6 +99,10 @@ fortunately some versions of Anaconda do support PyQt5 and 32-bit Windows XP.
 - Copy / paste image path from clipboard
 - Paste newline-separated paths as slideshow contents
 - Background color cycling
+- Delete current image
+- Refresh current image
+- Toggable thumbnail splitter pane
+- Asynchronous tumnbnail loading
 
 ## Requirements
 - Python 2.7

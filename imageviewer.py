@@ -155,7 +155,7 @@ def os_path_abspath(path):
     if ((not abspath.endswith(os.sep)) and os_path_isroot(abspath)):
         abspath += os.sep
 
-    info("os_path_abspath %r is %r", path, abspath)
+    dbg("os_path_abspath %r is %r", path, abspath)
     return abspath
 
 
@@ -212,8 +212,8 @@ def os_path_safelong(filepath):
 #     inside Qt appp?
 image_extensions = [".%s" % fmt for fmt in QImageReader.supportedImageFormats()]
 supported_extensions = image_extensions + [".lst"]
-first_image = -float("inf")
-last_image = float("inf")
+FIRST_IMAGE_DELTA = -float("inf")
+LAST_IMAGE_DELTA = float("inf")
 slideshow_interval_ms = 5000
 # XXX This interval is from the end of the current frame load, which causes
 #     variance depending on how much each frame took to load, in addition it's
@@ -229,6 +229,10 @@ listview_keyboard_search_timeout_secs = 0.75
 
 
 # queue is an old style class, inherit from object to make newstyle
+# XXX Use PriorityQueue? Would allow two priorities one for thumbs and another
+#     for main image, or even rolling priorities where stale images (thumbs,
+#     main) are left with lower prio. Currently this is done by emptying the
+#     queue on nagivating away from the image
 class Queue(queue.Queue, object):
     """
     Queue with a clear method to flush/drain the queue
@@ -237,6 +241,30 @@ class Queue(queue.Queue, object):
         # Call init directly since super can't be used in oldstyle classes which
         # queue is
         queue.Queue.__init__(self, *args, **kwargs)
+
+    def move_to_front(self, item):
+        # This assumes the item was in the queue at some point, but will only 
+        # be re-inserted if found while traversing, since it's possible the item
+        # was removed from a different thread while traversing
+        info("move_to_front %r", item)
+        entries = []
+        found = False
+        try:
+            while (True):
+                entry = self.get_nowait()
+                if (entry != item):
+                    entries.append(entry)
+                else:
+                    found = True
+        except queue.Empty:
+            pass
+
+        if (found):
+            self.put(item)
+
+        info("move_to_front restoring %d entries", len(entries))
+        for entry in entries:
+            self.put(entry)
 
     def clear(self):
         """
@@ -288,6 +316,10 @@ def prefetch_files(request_queue, response_queue):
             
             t = time.time()
             with open(long_filepath, "rb") as f:
+                # XXX Read in chunks to reduce chance of network failures? Could
+                #     also allow aborting to give higher prio to queued transfer
+                #     and to report progress, but the latter would need to be
+                #     cross-thread compatible (in some shared variable?)
                 data = f.read()
             t = time.time() - t
             info("worker prefetched data in %0.2fs %0.2fKB/s %r", t, len(data) / (t * 1024.0) if t > 0 else 0, long_filepath)
@@ -962,7 +994,12 @@ class ImageWidget(QLabel):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(1, 1)
         self.setAutoFillBackground(True)
-        self.setBackgroundColor(Qt.darkGray)
+        self.borderStyle = ""
+        self.backgroundColor = Qt.darkGray
+        self.backgroundColorStyle = ""
+        # Calculate and set the styles
+        self.setBorder(0)
+        self.setBackgroundColor(self.backgroundColor)
         
         self.originalPixmap = None
         self.text = None
@@ -983,15 +1020,31 @@ class ImageWidget(QLabel):
         """
         self.text = text
 
-    def setBackgroundColor(self, color):
-        self.backgroundColor = color
+    def commitStyles(self):
+        current_style = self.styleSheet()
+        new_style = self.borderStyle + self.backgroundColorStyle
+        # Don't cause repaint if no change
+        if (current_style != new_style):
+            dbg("old style %s new style %s", current_style, new_style)
+            self.setStyleSheet(new_style)
 
-        pal = self.palette()
-        pal.setColor(QPalette.Background, self.backgroundColor)
-        # palette() seems to be a copy, need to set the palette back for the
-        # change to take effect
-        pal = self.setPalette(pal)
-        
+    def setBorder(self, width, color=None):
+        self.borderStyle = "" if (width == 0) else " border: %dpx solid %s;" % (width, QColor(color).name())
+        self.commitStyles()
+
+    def setBackgroundColor(self, color):
+        # Background can be changed via 
+        #    pal.setColor(QPalette.Background, ...)
+        #    setPalette()
+        # but the palette is ignored once a stylesheet is set with setStyleSheet, 
+        # and the stylesheet is the only way of setting a border without 
+        # overriding the paint method, so change the background via setStyleSheet
+        # instead of using setPalette()
+        dbg("setBackground from %s to %s, %s", self.backgroundColor, color, color != self.backgroundColor)
+        self.backgroundColor = color
+        self.backgroundColorStyle = "" if color is None else " background-color: %s;" % QColor(color).name()
+        self.commitStyles()
+    
     def toggleFit(self):
         self.fitToSmallest = not self.fitToSmallest
         self.scroll = 0
@@ -1006,9 +1059,11 @@ class ImageWidget(QLabel):
         self.resizePixmap(self.size())
 
     def gammaCorrectPixmap(self, gamma):
-        info("gammaCorrectPixmap from %d to %d", self.gamma, gamma)
-        self.gamma = gamma
-        self.resizePixmap(self.size())
+        # Don't trigger repaint if already that value
+        if (gamma != self.gamma):
+            info("gammaCorrectPixmap from %d to %d", self.gamma, gamma)
+            self.gamma = gamma
+            self.resizePixmap(self.size())
 
 
     def resizePixmap(self, size):
@@ -1150,9 +1205,20 @@ class ImageViewer(QMainWindow):
         # Use the scripts directory as FileDialog opening dir
         self.image_filepath = sys.argv[0]
 
+        # Thumbnail pane settings
+        self.thumbnail_columns = 5
+        self.thumbnail_rows = 5
+        self.thumbnails_per_page = self.thumbnail_columns * self.thumbnail_rows
+
+        # Cache of recently generated thumbnails, currently only the ones in
+        # the current pane
+        self.filepath_to_thumbnail_pixmap = dict()
+
         self.cached_files = []
         # XXX This could have a max_size_bytes instead
-        self.cached_files_max_count = 20
+        # XXX This is x2 because the cache has +- around the current image, 
+        #     fix it so it has more in the direction of the movement?
+        self.cached_files_max_count = self.thumbnails_per_page * 2 + 2
 
         self.prefetch_request_queue = Queue()
         self.prefetch_response_queue = Queue()
@@ -1163,35 +1229,87 @@ class ImageViewer(QMainWindow):
         # XXX The "browse direction" cache should be larger than the opposite
         #     direction cache? (eg have more files forward if browsing forward)
         #     otherwise the cache is halved with typical forward browsing
-        self.prefetched_images_max_count = 10
+        self.prefetched_images_max_count = self.thumbnails_per_page * 2
         self.prefetch_pending = set()
-        self.prefetcher_count = (self.prefetched_images_max_count / 2) + 1
+        self.prefetcher_count = 4
 
         for i in xrange(self.prefetcher_count):
             thread.start_new_thread(prefetch_files, (self.prefetch_request_queue, self.prefetch_response_queue))
         
         w = QWidget(self)
         self.setCentralWidget(w)
-        l = QVBoxLayout()
-        w.setLayout(l)
-                
-        
+        hl = QHBoxLayout()
+        w.setLayout(hl)
+
+        splitter = QSplitter(Qt.Horizontal)
+        hl.addWidget(splitter)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+
+        w = QWidget(self)
+        self.thumbnailsWidget = w
+        gl = QGridLayout()
+        gl.setContentsMargins(0, 0, 0, 0)
+        gl.setSpacing(1)
+        # Put the thumbnails on a top widget, this makes easier to hide with a
+        # single call and also fixes some layout issues that happen if the
+        # gridlayout is added directly to the parent
+        w.setLayout(gl)
+        self.thumbWidgets = []
+        for i in xrange(self.thumbnails_per_page):
+            col = i % self.thumbnail_columns
+            row = i / self.thumbnail_columns
+            im = ImageWidget()
+            gl.addWidget(im, row, col)
+            gl.setRowStretch(row, 1)
+            gl.setRowMinimumHeight(row, 50)
+            gl.setColumnStretch(col, 1)
+            gl.setColumnMinimumWidth(col, 50)
+            self.thumbWidgets.append(im)
+            # XXX Missing connecting button click to changing main image and
+            #     focusing cell
+            
+        splitter.addWidget(w)
+
+        self.thumbnailsWidget.hide()
+
         imageWidget = ImageWidget()
         imageWidget.setMouseTracking(True)
         imageWidget.installEventFilter(self)
         self.imageWidget = imageWidget
-        
-        l.addWidget(self.imageWidget)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(0)
+
+        splitter.addWidget(imageWidget)
+
+        splitter.setSizes([600, 800])
+
+        self.emptyPixmap = QPixmap(10, 10)
+        # XXX Should probably use whatever background color the grid has?
+        self.emptyPixmap.fill(Qt.white)
+
+        self.loadingPixmap = QPixmap(10, 10)
+        # XXX Should refresh on changes to background color?
+        self.loadingPixmap.fill(self.imageWidget.backgroundColor)
+
+        self.errorPixmap = QPixmap(10, 10)
+        self.errorPixmap.fill(Qt.red)
+
 
         self.createActions()
         self.createMenus()
         self.createStatus()
         
         self.setWindowTitle("Image Viewer")
+        
         if (len(sys.argv) > 1):
             filepath = unicode(sys.argv[1])
+        else:
+            # Default parameter if running under debugger
+            if (hasattr(sys, 'gettrace') and sys.gettrace() is not None):
+                filepath = unicode(R"C:\Users\Public\Pictures\greg-rutkowski-castle-defence-1920.jpg")
+            else:
+                filepath = None
+
+        if (filepath is not None):
             self.loadImage(filepath)
             self.setRecentFile(filepath)
         
@@ -1213,6 +1331,16 @@ class ImageViewer(QMainWindow):
         #self.setGeometry(ag.topLeft().x() + frame_width / 2, ag.topLeft().y() + frame_height / 2, width - frame_height, height - frame_height)
         self.move(ag.topLeft())
         self.resize(width - frame_width, height - frame_height)
+
+        # XXX Thumbnails should be updated only when needed, ie when navigating
+        #     or when new thumbnails have finished loading, without need for a
+        #     timer, but that requires a QT thread blocking on the prefetch
+        #     thread, since the prefetch thread is currently a python thread and
+        #     cannot send Qt signals (or convert the prefetch thread to QT, but
+        #     needs to check it releases the GIL when necessary)
+        self.updateThumbnailsTimer = QTimer(self)
+        self.updateThumbnailsTimer.timeout.connect(self.updateThumbnails)
+        self.updateThumbnailsTimer.start(1000) 
 
     def clearRequests(self):
         info("clearRequests")
@@ -1386,27 +1514,69 @@ class ImageViewer(QMainWindow):
         #     See https://www.qtcentre.org/threads/39887-QMimeData-using-setText-and-setUrls-at-the-same-time
         
 
-    def getDataFromCache(self, filepath):
+    def getDataFromCache(self, filepath, block=True):
+        """
+        @return 
+        - bytes if image in cache and didn't fail to load
+        - None if image in cache and failed to load
+        - None if image not in cache and block=False
+        """
         assert isinstance(filepath, unicode) 
         # XXX Qt already has QPixmapCache, look into it?
 
         # Get the file from the cache and bring it to the front if in the cache,
         # request it and put it in the front otherwise
 
-        for i, entry in enumerate(self.cached_files):
+        # XXX Use a set/dict/ordereddict for this test
+        try:
+            filepaths = [entry_filepath for entry_filepath, entry_data in self.cached_files]
+            i = filepaths.index(filepath)
+            info("cache hit for %r", filepath)
+            entry = self.cached_files[i]
             entry_filepath, entry_data = entry
-            dbg("cache entry %r vs. %r", entry_filepath, filepath)
-            if (filepath == entry_filepath):
-                info("cache hit for %r", filepath)
-                self.cached_files.pop(i)
-                # Put it at the beginning of the LRU cache
-                self.cached_files.insert(0, entry)
-                break
+            self.cached_files.pop(i)
+            # Put it at the beginning of the LRU cache
+            self.cached_files.insert(0, entry)
 
-        else:
-
+        except ValueError:
             info("cache miss for %r", filepath)
-            
+
+            if (block):
+                # Empty the request queues so:
+                # - this image request takes higher priority
+                # - stale prefetches around this image don't accumulate (ok
+                #   to discard because prefetch is restarted below)
+                # - stale thumbnail requests don't accumulate when moving across
+                #   thumbnail pages (ok to discard because updateThumbnails will
+                #   also re-request as needed) 
+
+                # XXX Additionally this could signal the prefetch threads to
+                #     abort the current transfers, but to do it efficiently, it
+                #     requires the prefetch threads to chunk the reads and check
+                #     on some flag
+
+                # XXX Should this happen even if there's a cache hit so stale
+                #     thumbnails are always removed?
+                
+                # XXX Inferring there are stale thumbnails/prefetches from the
+                #     block parameter is hacky and will probably break once
+                #     reading the main image is non-blocking, should probably be
+                #     moved elsewhere, in gotoImage, etc?
+
+                self.prefetch_request_queue.clear()
+                info("removed ~%d stale requests", len(self.prefetch_pending))
+                # Note clearing the prefetch_pending set here may cause the
+                # prefetch_pending set to get out of sync wrt
+                # prefetch_response_queue: a prefetch request may be serviced by
+                # the prefetch thread before it had the chance to be serviced in
+                # this thread and this thread will receive a stale prefetch
+                # without a corresponding item in the prefetch_pending set
+                # cleared here. This is ok since this thread .discards items
+                # from the set instead of .removing them, and .discard doesn't
+                # require the item to be in the set
+                
+                self.prefetch_pending.clear()
+
             # The filepath is not in the cache, request if not already pending
             if (filepath not in self.prefetch_pending):
                 info("prefetch pending miss for %r", filepath)
@@ -1416,27 +1586,33 @@ class ImageViewer(QMainWindow):
 
             else:
                 info("prefetch pending hit for %r", filepath)
+
                 
             # Drain the requests as they are satisfied until the requested one
             # is found. Note this won't be in order if there are more than one
             # prefetcher threads
-            
-            # XXX Sometimes the current image may be stuck behind a furure 
-            #     prefetch, investigate?
-            #     - Does this only happen when slideshow starts, or also in the
-            #       middle?
-            #     - Pause all prefetch threads but for the one servicing this
-            #       request? 
-            #     - Have a high priority prefetch thread?
-            #     - Prefetch block by block and pause when not high prio or
-            #       allow partial prefetches and switch to a hi prio prefetch?
-            #     - Use a heap queue?
             while (True):
-                info("Popping prefetch response queue for %r", filepath)
-                entry_filepath, entry_data = self.prefetch_response_queue.get()
+                # info("Popping prefetch response queue for %r", filepath)
+                try:
+                    entry_filepath, entry_data = self.prefetch_response_queue.get(block)
+                except queue.Empty:
+                    # Not blocking and no more items, return None, item was put
+                    # in the prefetch request queue, but caller will need to
+                    # call again until it appears in the prefetch response queue
+                    entry_filepath = None
+                    entry_data = None
+                    break
                 info("Popped prefetch response queue %r for %r", entry_filepath, filepath)
                 
-                self.prefetch_pending.remove(entry_filepath)
+                # prefetch_pending may be out of sync with
+                # prefetch_response_queue when the  prefetch_pending set is
+                # cleared above to give higher priority to more recent requests.
+                # In that case this filepath may not be in the prefetch_pending
+                # set because it was processed by the prefetch thread before the
+                # prefetch request queue was cleared. Use .discard instead of
+                # .remove, which doesn't require the item to be in the set, to
+                # account for that.
+                self.prefetch_pending.discard(entry_filepath)
 
                 if (entry_data is not None):
                     if (len(self.cached_files) >= self.cached_files_max_count):
@@ -1445,11 +1621,155 @@ class ImageViewer(QMainWindow):
                     info("inserting in cache %r", entry_filepath)
                     self.cached_files.insert(0, (entry_filepath, entry_data))
                     info("inserted in cache %r", entry_filepath)
-
+                    
                 if (entry_filepath == filepath):
                     break
 
         return entry_data
+
+
+    def updateThumbnails(self):
+        dbg("updateThumbnails")
+        if (not self.thumbnailsWidget.isVisible()):
+            return
+            
+        filepaths = self.image_filepaths
+        if (filepaths is None):
+            return
+
+        if (not self.updateThumbnailsTimer.isActive()):
+            # Don't reenter this function, can happen when called from
+            # QApplication.processEvents() below
+            return
+
+        # Stop the timer so multiple timer triggers are not queued if this code
+        # takes more than the interval to run, restart the timer at the end.
+        # Making the timer inactive also allows detecting reentrance into this
+        # function, used above
+        self.updateThumbnailsTimer.stop()
+
+        # Collect the filepaths in this thumbnail page. Account for more
+        # thumbnail slots than filepaths or viceversa
+        try:
+            i = filepaths.index(self.image_filepath)
+            page = i / self.thumbnails_per_page
+            i = page*self.thumbnails_per_page
+            filepaths = filepaths[i:i+self.thumbnails_per_page]
+        except ValueError:
+            filepaths = self.image_filepaths[:self.thumbnails_per_page]
+
+        # Fill the thumbnail slots with the appropriate image: filepath image,
+        # loading image, failed image, or empty image
+        restore_cursor = False
+        for filepath, thumbWidget in zip(filepaths, self.thumbWidgets[:len(filepaths)]):
+            scaled_pixmap = self.filepath_to_thumbnail_pixmap.get(filepath, None)
+            if ((scaled_pixmap != thumbWidget.originalPixmap) or (scaled_pixmap is None)):
+                if (scaled_pixmap is None):
+                    entry = self.getDataFromCache(filepath, False)
+                    # XXX this cannot tell if the image failed to load,
+                    #     getDataFromCache should return false instead of None
+                    #     in that case?
+                    if (entry is None):
+                        if (thumbWidget.originalPixmap != self.loadingPixmap):
+                            scaled_pixmap = self.loadingPixmap
+                        else:
+                            # Don't cause continuous creation until found
+                            continue
+                    else:
+                        info("Setting thumbnail %r", filepath)
+                        file_data, file_stat = entry
+                        buffer = QBuffer()
+                        buffer.setData(file_data)
+                        buffer.open(QIODevice.ReadOnly)
+                        reader = QImageReader(buffer)
+                        # XXX Reading seems to take the most time, especially
+                        #     for svg, should happen on a QT thread but to be
+                        #     worth it need to check that it releases the GIL.
+                        #     May also need some hysteresis/queue purging in
+                        #     case keyboard movement is way ahead of the reader
+                        #     thread and check that the read image is still the
+                        #     one being displayed
+                        info("Reading thumbnail %r", filepath)
+                        if (not restore_cursor):
+                            QApplication.setOverrideCursor(Qt.WaitCursor)
+                            restore_cursor = True
+                        image = reader.read()
+                        if (image.isNull()):
+                            pixmap = self.errorPixmap
+
+                        else:
+                            pixmap = QPixmap.fromImage(image)
+
+                        # This could use the thumbWidget.size() but then it
+                        # needs refreshing when the splitter changes
+                        # XXX Use screen DPI to calculate the best thumbnail size?
+                        info("Scaling thumbnail %r", filepath)
+                        scaled_pixmap = pixmap.scaled(150, 150, 
+                            Qt.KeepAspectRatioByExpanding if (False) else Qt.KeepAspectRatio, 
+                            Qt.SmoothTransformation)
+
+                        self.filepath_to_thumbnail_pixmap[filepath] = scaled_pixmap
+
+                        info("Set thumbnail %r", filepath)
+
+                thumbWidget.setPixmap(scaled_pixmap)
+                # XXX Can the grid be updated instead of each individual imagewidget?
+                thumbWidget.resizePixmap(thumbWidget.size())
+                # reader.erad() above can take some time, update the UI. This
+                # allows the UI to update before loading the thumbnails,
+                # otherwise the UI feels unresponsive when gotoImage is called
+                # when toggling the thumbnails and the thumbnail grid doesn't
+                # appear. Another option is to Timer.singleShot(700,
+                # self.updateThumbnails) But the time required so the UI is
+                # updated before updateThumbnails blocks the UI seems to be
+                # greater than 500 and lower than 1000
+                # XXX When switching thumbnail pages, this shows the old
+                #     thumbnails until the new ones are loaded, do a first pass
+                #     setting all thumbs to loading?
+                # XXX The focus rectangle may be moved in the processEvents
+                #     below but the UI won't sync until this updateThumbnails is
+                #     done, which can cause two focus rectangles or none. Sync
+                #     the focus rectangle independently from updateThumbnails?
+                # XXX The above issues would get fixed by doing proper async
+                #     reader.read in a QThread instead, assuming it releases the
+                #     GIL?
+                QApplication.processEvents()
+
+            # Set the current thumbnail rectangle and background or remove it 
+            # in case it was previously set
+            if (filepath == self.image_filepath):
+                thumbWidget.setBackgroundColor(Qt.white)
+                thumbWidget.setBorder(3, Qt.red)
+
+            else:
+                # XXX Needs to refresh all thumbnails background if user changes
+                #     background color?
+                thumbWidget.setBackgroundColor(Qt.darkGray)
+                thumbWidget.setBorder(0)
+        
+        # Set all unused thumnail slots to empty
+        for i in xrange(len(self.thumbWidgets)-len(filepaths)):
+            thumbWidget = self.thumbWidgets[len(filepaths)+i]
+            if (thumbWidget.originalPixmap is not self.emptyPixmap):
+                thumbWidget.setPixmap(self.emptyPixmap)
+                thumbWidget.setBackgroundColor(Qt.white)
+                thumbWidget.setBorder(0)
+                # Force a repaint since the pixmap was changed
+                thumbWidget.resizePixmap(thumbWidget.size())
+
+        # Cleanup filepath_to_thumbnail_pixmap
+        # XXX This removes all thumbnail pixmaps for the previous and next 
+        #     thumbnail pages, have a variable number of thumbnail pixmaps cached?
+        # XXX Also cleanup filepath_to_thumbnail_pixmap and the thumbWidgets
+        #     when caches are cleared? (open new dir, etc)
+        for filepath in set(self.filepath_to_thumbnail_pixmap.keys()).difference(filepaths):
+            info("Removing stale thumbnail pixmap for %s", filepath)
+            del self.filepath_to_thumbnail_pixmap[filepath]
+
+        self.updateThumbnailsTimer.start()
+
+        if (restore_cursor):
+            QApplication.restoreOverrideCursor()
             
     def loadImage(self, filepath, index = None, count = None, frame = None):
         info("loadImage %r %s %s", filepath, index, count)
@@ -1496,6 +1816,7 @@ class ImageViewer(QMainWindow):
             if (index is None):
                 # XXX Index and count passed as parameter is messy, should only
                 #     update the internal variables when needed?
+                # XXX Why this special casing to reset the filenames cache?
                 if (frame is None):
                     self.image_filepaths = None
                     self.image_index = 0
@@ -1522,7 +1843,7 @@ class ImageViewer(QMainWindow):
         info("Cached %r", filepath)
         if (data is None):
             QMessageBox.information(self, "Image Viewer",
-                    "Cannot load %s." % filepath)
+                "Cannot load %s." % filepath)
             image = None
             
         else:
@@ -1610,6 +1931,12 @@ class ImageViewer(QMainWindow):
             
             info("frame %s/%d tell %d", frame, reader.imageCount(), buffer.pos())
 
+            # XXX Reading seems to take the most time, especially for svg,
+            #     should happen on a QT thread but needs to check that it
+            #     releases the GIL. May also need some hysteresis/queue purging
+            #     in case keyboard movement is way ahead of the reader thread
+            #     and check that the read image is still the one being displayed
+            info("reading image %r", filepath)
             image = reader.read()
 
             if ((self.animation_timer is not None) and (self.animationAct.isChecked())):
@@ -1628,14 +1955,15 @@ class ImageViewer(QMainWindow):
             # Create a dummy image, this is the easiest way of preventing
             # exceptions everywhere when an invalid file is encountered
             # (prev/next navigation, etc)
-            image = QImage(10, 10, QImage.Format_RGB32)
-            image.fill(self.imageWidget.backgroundColor)
             file_data = []
             file_stat = None
+            pixmap = self.errorPixmap
+        
+        else:
+            pixmap = QPixmap.fromImage(image)
 
         self.image_filepath = filepath
         
-        pixmap = QPixmap.fromImage(image)
         # Reset the scroll unless it's another frame of an animated image
         if (frame is None):
             # XXX Resetting the scroll here is probably redundant with other
@@ -1700,7 +2028,6 @@ class ImageViewer(QMainWindow):
         if (redraw):
             self.imageWidget.resizePixmap(self.imageWidget.size())
 
-
     def showMessage(self, msg, timeout_ms=0):
         self.status_message_timer.stop()
         self.status_message_widget.setText(msg)
@@ -1733,6 +2060,54 @@ class ImageViewer(QMainWindow):
             " %2.1f" % self.animation_fps if (self.animationAct.isEnabled() and self.animationAct.isChecked()) else ""
         ))
 
+    def deleteImage(self):
+        if (QMessageBox.question(self, "Image Viewer",
+            "Delete %s." % os.path.basename(self.image_filepath), buttons=QMessageBox.Yes|QMessageBox.No|QMessageBox.Cancel, defaultButton=QMessageBox.Yes) == QMessageBox.Yes):
+            # Clear the file cache and force the directory to be reloaded
+            
+            # XXX This interacts badly when there's an .lst file loaded, the
+            #     current image directory is loaded instead of reloading the
+            #     .lst file, fix
+
+            # XXX With .lst images does this mean to remove the image from the
+            #     .lst too? only from the .lst?
+            
+            # XXX What to do when a single file was loaded and it's deleted?
+            self.image_filepaths = None
+            os.remove(self.image_filepath)
+            # Filling the file cache will reset self.image_index when
+            # self.image_filepath is not found, so the delta has to be the
+            # current self.image_index
+            self.gotoImage(self.image_index)
+            
+    def refreshImage(self, all=False):
+        if (all):
+            # Clear the file cache and force the directory to be reloaded
+            # XXX This interacts badly when there's an .lst file loaded, the
+            #     current image directory is loaded instead of reloading the
+            #     .lst file, fix
+            self.image_filepaths = None
+            self.cached_files = []
+            self.filepath_to_thumbnail_pixmap.clear()
+
+        else:
+            # XXX This try is not necessary unless loadimage is non-blocking 
+            #     because cached_files.index should always have the image?
+            try:
+                filepath = self.image_filepath
+                filepaths = [entry_filepath for entry_filepath, entry_data in self.cached_files]
+                i = filepaths.index(filepath)
+                self.cached_files.pop(i)
+                # Note filepath may not be in thumbnails if in the thumnail pane
+                # is not shown
+                if (filepath in self.filepath_to_thumbnail_pixmap):
+                    del self.filepath_to_thumbnail_pixmap[filepath]
+        
+            except ValueError:
+                pass
+
+        self.gotoImage(0)
+        
     def animationToggled(self):
         if (self.animationAct.isChecked()):
             info("starting animation timer")
@@ -1784,6 +2159,19 @@ class ImageViewer(QMainWindow):
 
         self.updateStatus()
 
+    def thumbnailsToggled(self):
+        states = ((True, False), (True, True), (False, True))
+        i = states.index((self.imageWidget.isVisible(), self.thumbnailsWidget.isVisible()))
+        delta =  -1 if (QApplication.keyboardModifiers() & Qt.ShiftModifier) else 1
+        next_state = states[(i + delta) % len(states)]
+        self.imageWidget.setVisible(next_state[0])
+        self.thumbnailsWidget.setVisible(next_state[1])
+        if (self.thumbnailsWidget.isVisible()):
+            # The filepath cache will be None the first time after loading a
+            # single image, force loading the filepath cache so the thumbnails
+            # can be loaded. This also causes updateThumbnails to be called
+            self.gotoImage(0)
+            
     def fullscreenToggled(self):
         #self.setWindowFlags(self.windowFlags() ^ Qt.FramelessWindowHint)
         # Needs showing after changing flags
@@ -1816,8 +2204,18 @@ class ImageViewer(QMainWindow):
             
         
     def gotoImage(self, delta):
+        """
+        Navigate to the Nth previous or next image.
+
+        @param delta Number of images to move forwards (positive) or backwards
+            (negative). Normally will be 1 or -1 when navigating left/right keys
+            but could be larger when driven with the mousewheel or other keys 
+            Also called with delta = 0 to refresh filepaths, etc
+        """
         info("gotoImage %s", delta)
         if (self.image_filepaths is None):
+            # Initialize filepaths with the files in the current directory
+
             image_dirname = os.path.dirname(self.image_filepath)
             info("listing %r", image_dirname)
             QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -1863,15 +2261,15 @@ class ImageViewer(QMainWindow):
         except ValueError as e:
             prev_i = 0
 
-        if (delta == first_image):
+        if (delta == FIRST_IMAGE_DELTA):
             i = 0
 
-        elif (delta == last_image):
+        elif (delta == LAST_IMAGE_DELTA):
             i = len(filepaths) - 1
 
         else:
-            i = (prev_i + delta + len(filepaths)) % len(filepaths)
 
+            i = (prev_i + delta + len(filepaths)) % len(filepaths)
             # Offer to load a new file if at the end
             if ((prev_i + delta < 0) or (prev_i + delta >= len(filepaths))):
                 filepath = self.askForFilepath()
@@ -1888,6 +2286,11 @@ class ImageViewer(QMainWindow):
             # forward and backward prefetching (this prefetches out of order wrt
             # delta, but note that images will be returned out of order anyway
             # if there are multiple prefetch threads)
+            # XXX This should favor the browsing direction?
+            # XXX Think if this is the right prefetch behavior, right now when
+            #     moving up/down/left/right it's fetching and evicting images,
+            #     have some page granularity so it doesn't fetch if moving inside 
+            #     the same page?
             delta = 1
             for _ in xrange(self.prefetched_images_max_count):
                 filepath = filepaths[(i + delta + len(filepaths)) % len(filepaths)]
@@ -1905,6 +2308,9 @@ class ImageViewer(QMainWindow):
         if (self.slideshow_timer is not None):
             self.slideshow_timer.start(slideshow_interval_ms)
 
+        # Update thumbnails explicitly to avoid updateThumbnailsTimer latency
+        self.updateThumbnails()
+        
     def toggleFit(self):
         self.imageWidget.toggleFit()
         self.scroll = 0
@@ -1925,10 +2331,10 @@ class ImageViewer(QMainWindow):
         self.updateStatus()
 
     def firstImage(self):
-        self.gotoImage(first_image)
+        self.gotoImage(FIRST_IMAGE_DELTA)
 
     def lastImage(self):
-        self.gotoImage(last_image)
+        self.gotoImage(LAST_IMAGE_DELTA)
 
 
     def getCanvasPixmapLimits(self):
@@ -2006,6 +2412,26 @@ class ImageViewer(QMainWindow):
             self.imageWidget.scroll = 0
             self.gotoImage(1)
 
+    def prevPage(self):
+        # Don't do image scrolling and reset image scrolling it
+        self.imageWidget.scroll = 0
+        self.gotoImage(-self.thumbnails_per_page)
+
+    def nextPage(self):
+        # Don't do image scrolling and reset image scrolling it
+        self.imageWidget.scroll = 0
+        self.gotoImage(self.thumbnails_per_page)
+
+    def prevRow(self):
+        # Don't do image scrolling and reset image scrolling it
+        self.imageWidget.scroll = 0
+        self.gotoImage(-self.thumbnail_columns)
+
+    def nextRow(self):
+        # Don't do image scrolling and reset image scrolling it
+        self.imageWidget.scroll = 0
+        self.gotoImage(self.thumbnail_columns)
+
     def about(self):
         QMessageBox.about(self, "About Image Viewer",
                 "<p>Simple no-frills <b>Image Viewer</b> optimized for high latency network drives</p>")
@@ -2014,26 +2440,31 @@ class ImageViewer(QMainWindow):
         def createGlobalAction(title, triggered, shortcut, checkable=False, enabled=True):
             # Note shortcut parameter is compulsory since global actions need to
             # be able to be called when there's no menubar
-            action = QAction(title, self, shortcut=shortcut, triggered=triggered, enabled=enabled, checkable=checkable)
+            if (isinstance(shortcut, list)):
+                shortcuts = shortcut
+            else:
+                shortcuts = [shortcut]
+
+            action = QAction(title, self, triggered=triggered, enabled=enabled, checkable=checkable)
+            # QAction constructor doesn't allow multiple shortcuts, use
+            # setShortcuts after construction instead
+            action.setShortcuts(shortcuts)
             
             # It's necessary to add the actions to the widget because in
             # fullscreen mode there's no menubar to route them
+            # XXX a widget-agnostic option would be to use QSortcut?
+            #     QShortcut(action.shortcut(), self, action.trigger)
+            self.centralWidget().addAction(action)
             
-            # XXX This assumes the imageWidget has already been created and it's
-            #     the main widget, a widget-agnostic option would be to use
-            #     QSortcut?
-            #       QShortcut(action.shortcut(), self, action.trigger)
-            self.imageWidget.addAction(action)
-
             return action
 
         self.openAct = createGlobalAction("&Open...", shortcut="O", triggered=self.open)
 
-        self.openFromClipboardAct = createGlobalAction("O&pen From Clipboard", shortcut="Ctrl+V",
+        self.openFromClipboardAct = createGlobalAction("O&pen From Clipboard", shortcut="Ctrl+v",
             triggered=self.openFromClipboard)
 
         self.copyToClipboardAct = createGlobalAction("&Copy To Cli&pboard", enabled=False, 
-            shortcut="Ctrl+C", triggered=self.copyToClipboard)
+            shortcut="Ctrl+c", triggered=self.copyToClipboard)
 
         self.exitAct = createGlobalAction("E&xit", shortcut="esc", triggered=self.close)
 
@@ -2046,9 +2477,21 @@ class ImageViewer(QMainWindow):
         # XXX Support fit window to width, fit window to image
         # XXX Support arbitrary scrolling
         # XXX Support arbitrary zooming
+        # XXX Support renaming images
+        # XXX Support multiple image selection
+        # XXX Support image search/filtering by filename
+        # XXX Support saving thumbnail page/s as big image
         
         self.toggleFitAct = createGlobalAction("&Fit To Smallest", enabled=False, 
             shortcut="F", triggered=lambda : self.toggleFit())
+
+        self.deleteImageAct = createGlobalAction("Delete", enabled=False, 
+            shortcut="del", triggered=self.deleteImage)
+
+        self.refreshImageAct = createGlobalAction("Refresh", enabled=False, 
+            shortcut="ctrl+r", triggered=self.refreshImage)
+        self.refreshAllImagesAct = createGlobalAction("Refresh All", enabled=False, 
+            shortcut="ctrl+shift+r", triggered=lambda : self.refreshImage(True))
         
         self.rotateRightAct = createGlobalAction("Rotate Ri&ght", enabled=False, 
             shortcut="R", triggered=lambda : self.rotateImage(90))
@@ -2061,22 +2504,33 @@ class ImageViewer(QMainWindow):
         self.fullscreenAct = createGlobalAction("&Fullscreen", enabled=False,
             checkable=True, shortcut="return", triggered=self.fullscreenToggled)
 
+        self.toggleThumbnailsAct = createGlobalAction("Toggle &Thumbnails/Image", enabled=False,
+            checkable=False, shortcut=["T", "Shift+T"], triggered=self.thumbnailsToggled)
+        
         self.nextBackgroundColorAct = createGlobalAction("Next &Background Color", 
             shortcut="B", triggered=lambda : self.cycleBackgroundColor(True))
         self.prevBackgroundColorAct = createGlobalAction("Previous Background Color",
             shortcut="Shift+B", triggered=lambda : self.cycleBackgroundColor(False))
         
-        self.firstImageAct = createGlobalAction("Fi&rst Image", shortcut="up", 
-            enabled=False, triggered=self.firstImage)
-
-        self.lastImageAct = createGlobalAction("&Last Image", shortcut="down", 
-            enabled=False, triggered=self.lastImage)
-
         self.prevImageAct = createGlobalAction("&Previous Image", shortcut="left", 
             enabled=False, triggered=self.prevImage)
-
         self.nextImageAct = createGlobalAction("&Next Image", shortcut="right", 
             enabled=False, triggered=self.nextImage)
+
+        self.prevRowAct = createGlobalAction("Previous Row", shortcut="up", 
+            enabled=False, triggered=self.prevRow)
+        self.nextRowAct = createGlobalAction("Next Row", shortcut="down", 
+            enabled=False, triggered=self.nextRow)
+
+        self.prevPageAct = createGlobalAction("Previous Page", shortcut=["page up", "ctrl+up"], 
+            enabled=False, triggered=self.prevPage)
+        self.nextPageAct = createGlobalAction("Next Page", shortcut=["page down", "ctrl+down"], 
+            enabled=False, triggered=self.nextPage)
+
+        self.firstImageAct = createGlobalAction("Fi&rst Image", shortcut=["home", "ctrl+left"], 
+            enabled=False, triggered=self.firstImage)
+        self.lastImageAct = createGlobalAction("&Last Image", shortcut=["end", "ctrl+right"], 
+            enabled=False, triggered=self.lastImage)
         
         self.slideshowAct = createGlobalAction("Toggle Slidesho&w", shortcut="space", 
             checkable=True, enabled=False, triggered=self.slideshowToggled)
@@ -2105,6 +2559,10 @@ class ImageViewer(QMainWindow):
         self.viewMenu = QMenu("&View", self)
         self.viewMenu.addAction(self.toggleFitAct)
         self.viewMenu.addSeparator()
+        self.viewMenu.addAction(self.refreshImageAct)
+        self.viewMenu.addAction(self.refreshAllImagesAct)
+        self.viewMenu.addAction(self.deleteImageAct)
+        self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.rotateLeftAct)
         self.viewMenu.addAction(self.rotateRightAct)
         self.viewMenu.addSeparator()
@@ -2115,10 +2573,16 @@ class ImageViewer(QMainWindow):
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.fullscreenAct)
         self.viewMenu.addSeparator()
+        self.viewMenu.addAction(self.toggleThumbnailsAct)
+        self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.firstImageAct)
         self.viewMenu.addAction(self.lastImageAct)
         self.viewMenu.addAction(self.prevImageAct)
         self.viewMenu.addAction(self.nextImageAct)
+        self.viewMenu.addAction(self.prevPageAct)
+        self.viewMenu.addAction(self.nextPageAct)
+        self.viewMenu.addAction(self.prevRowAct)
+        self.viewMenu.addAction(self.nextRowAct)
         self.viewMenu.addSeparator()
         self.viewMenu.addAction(self.slideshowAct)
         self.viewMenu.addSeparator()
@@ -2168,6 +2632,9 @@ class ImageViewer(QMainWindow):
         
     def updateActions(self):
         self.copyToClipboardAct.setEnabled(True)
+        self.refreshImageAct.setEnabled(True)
+        self.deleteImageAct.setEnabled(True)
+        self.refreshAllImagesAct.setEnabled(True)
         self.toggleFitAct.setEnabled(True)
         self.rotateLeftAct.setEnabled(True)
         self.rotateRightAct.setEnabled(True)
@@ -2176,9 +2643,14 @@ class ImageViewer(QMainWindow):
         self.lastImageAct.setEnabled(True)
         self.prevImageAct.setEnabled(True)
         self.nextImageAct.setEnabled(True)
+        self.prevPageAct.setEnabled(True)
+        self.nextPageAct.setEnabled(True)
+        self.prevRowAct.setEnabled(True)
+        self.nextRowAct.setEnabled(True)
         self.slideshowAct.setEnabled(True)
         self.animationAct.setEnabled(self.animation_count > 1)
         self.fullscreenAct.setEnabled(True)
+        self.toggleThumbnailsAct.setEnabled(True)
         self.nextBackgroundColorAct.setEnabled(True)
         self.prevBackgroundColorAct.setEnabled(True)
         
