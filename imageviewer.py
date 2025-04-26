@@ -47,13 +47,14 @@ XXX Take a look on whether logging needs %r because of unicode (print to non
 
 import datetime
 import logging
+import multiprocessing
 import os
 import Queue as queue
 import re
 import stat
 import string
 import sys
-import thread
+import threading
 import time
 
 from PyQt5.QtCore import *
@@ -181,6 +182,123 @@ def os_path_safelong(filepath):
             
     return long_filepath
 
+g_image_reader_lock = threading.Lock()
+def qThreadSafeImageReader(buffer):
+    """
+    This was found on pyqt5 win64 with qt5Core.dll 5.3.1.0
+
+    There's a Qt/pyqt5 bug that causes a deadlock between the main thread and
+    worker threads when accessing completely unrelated QImageReader instances 
+    (note qt dlls below are using export symbols so function names and offsets can be off):
+
+    Thread 0  Id: 34c0.55b0 Suspend: 0 Teb: 00000000`00efe000 Unfrozen
+        # Child-SP          RetAddr               Call Site
+       00 00000000`011e9898 00007fff`a048920e     ntdll!NtWaitForSingleObject+0x14
+       01 00000000`011e98a0 00000000`576e5ce8     KERNELBASE!WaitForSingleObjectEx+0x8e
+       02 00000000`011e9940 00000000`576c11d9     Qt5Core!QBasicMutex::lockInternal+0x148
+       03 00000000`011e9970 00007fff`98998285     Qt5Core!QMutexLocker::QMutexLocker+0x19
+       04 00000000`011e99a0 00007fff`9899a07f     Qt5Gui!QImageReader::clipRect+0xd5
+       05 00000000`011e9b20 00007fff`98999a81     Qt5Gui!QImageReader::imageFormat+0x48f
+       06 00000000`011e9ba0 00007fff`98d3b2b8     Qt5Gui!QImageReader::imageCount+0x11
+       07 00000000`011e9bd0 00000000`57e6cdd9     QtGui!initQtGui+0x300e8
+       08 00000000`011e9c10 00000000`57ed3028     python27!PyCFunction_Call+0x69 [c:\build27\cpython\objects\methodobject.c @ 81] 
+       09 00000000`011e9c40 00000000`57ed050b     python27!call_function+0x328 [c:\build27\cpython\python\ceval.c @ 4376] 
+       0a 00000000`011e9ca0 00000000`57ed1a81     python27!PyEval_EvalFrameEx+0x3a3b [c:\build27\cpython\python\ceval.c @ 3017] 
+       0b 00000000`011e9db0 00000000`57ed3269     python27!PyEval_EvalCodeEx+0x911 [c:\build27\cpython\python\ceval.c @ 3608] 
+       0c 00000000`011e9e60 00000000`57ed30af     python27!fast_function+0x139 [c:\build27\cpython\python\ceval.c @ 4475] 
+       ...
+
+    Thread 10  Id: 34c0.2bfc Suspend: 0 Teb: 00000000`00f18000 Unfrozen
+    # Child-SP          RetAddr               Call Site
+    00 00000000`0baff078 00007fff`a048920e     ntdll!NtWaitForSingleObject+0x14
+    01 00000000`0baff080 00000000`57ecc765     KERNELBASE!WaitForSingleObjectEx+0x8e
+    02 00000000`0baff120 00000000`57ef8338     python27!PyEval_RestoreThread+0x55 [c:\build27\cpython\python\ceval.c @ 359] 
+    03 00000000`0baff150 00007fff`9c7b428c     python27!PyGILState_Ensure+0x88 [c:\build27\cpython\python\pystate.c @ 625] 
+    04 00000000`0baff180 00007fff`9905ab99     sip+0x428c
+    *** WARNING: Unable to verify checksum for qico.dll
+    05 00000000`0baff1e0 00007fff`9c491b20     QtCore!initQtCore+0x1e0d9
+    06 00000000`0baff220 00007fff`9c491426     qico+0x1b20
+    07 00000000`0baff290 00007fff`98998b6e     qico+0x1426
+    08 00000000`0baff2c0 00007fff`9899a07f     Qt5Gui!QImageReader::clipRect+0x9be
+    09 00000000`0baff440 00007fff`9899a64d     Qt5Gui!QImageReader::imageFormat+0x48f
+    0a 00000000`0baff4c0 00007fff`9899a54a     Qt5Gui!QImageReader::read+0x5d
+    0b 00000000`0baff530 00007fff`98d3af6e     Qt5Gui!QImageReader::read+0x3a
+    0c 00000000`0baff5c0 00000000`57e6cdd9     QtGui!initQtGui+0x2fd9e
+    0d 00000000`0baff620 00000000`57ed3028     python27!PyCFunction_Call+0x69 [c:\build27\cpython\objects\methodobject.c @ 81] 
+
+    Thread 0 above has the GIL and is calling into imageCount(), which grabs a 
+    QMutexLocker, 
+
+    0:010> ? 55b0
+    Evaluate expression: 21936 = 00000000`000055b0
+    0:010> dx -r1 _PyThreadState_Current
+    _PyThreadState_Current                 : 0x3343e70 [Type: _ts *]
+        ...
+        [+0x084] gilstate_counter : 2 [Type: int]
+        [+0x088] async_exc        : 0x0 [Type: _object *]
+        [+0x090] thread_id        : 21936 [Type: long]
+        ...
+    https://github.com/certik/python-2.7/blob/master/Python/pystate.c
+
+    thread 10 has probably grabbed that QMutexLocker but is waiting on the GIL 
+    (again note that the export symbols are probably hiding that the callstack 
+    is deep inside createReadHandlerHelper)
+
+    0:010> ? 2bfc
+    Evaluate expression: 11260 = 00000000`00002bfc
+    0:010> dx -r1 ((python27!_ts *)0x3e34ff0)
+    ((python27!_ts *)0x3e34ff0)    
+        ...
+        [+0x084] gilstate_counter : 1 [Type: int]
+        [+0x088] async_exc        : 0x0 [Type: _object *]
+        [+0x090] thread_id        : 11260 [Type: long]
+        ...
+
+    This seems to be because QImageReader createReadHandlerHelper takes a lock
+    in order to initialize the plugin libraries: The main thread grabs the
+    QImageReader lock and then relinquishes the GIL, then the thread with he GIL gets
+    stuck waiting on the QImageReader lock without releasing it.
+
+    static QImageIOHandler *createReadHandlerHelper(QIODevice *device,
+    ...
+    static QMutex mutex;
+    QMutexLocker locker(&mutex);
+    ...
+    https://github.com/qt/qtbase/blob/v5.3.1/src/gui/image/qimagereader.cpp#L225
+
+    The lock is not taken at creation, but in the first member function that
+    finds the handler uninitialized, eg for imageCount the check for initialization
+    is
+
+    int QImageReader::imageCount() const
+    {
+        if (!d->initHandler())
+            return -1;
+        return d->handler->imageCount();
+    }
+    https://github.com/qt/qtbase/blob/v5.3.1/src/gui/image/qimagereader.cpp#L1315
+
+
+    The workaround is to perform the first QImageReader call under a lock so
+    all calls to initHanlder and createReadHandlerHelper are serialized by Python
+
+    Another possibility could be not access the QImageReader from the main
+    thread but from the worker thread, since it looks like competing worker 
+    threads have a different timing that avoid or make this issue less frequent,
+    but this workaround is simpler and more fail proof.
+
+    This links the buffer lifetime to the reader in order to avoid the buffer 
+    being garbage collected while still in use by the reader and the application
+    silently exiting
+    """
+    reader = QImageReader(buffer)
+    with g_image_reader_lock:
+        reader.imageCount()
+        # Link the buffer to the reader lifetime, this prevents the buffer
+        # from being garbage collected before the reader is done with it, which
+        # causes the app to silently exit
+        reader.safe_buffer = buffer
+    return reader
 
 # XXX Support animations via QMovie of a local temp file or QImageReader of
 #     QBuffer/QIODevice of a python buffer in the file cache, to avoid PyQt
@@ -215,17 +333,18 @@ supported_extensions = image_extensions + [".lst"]
 FIRST_IMAGE_DELTA = -float("inf")
 LAST_IMAGE_DELTA = float("inf")
 slideshow_interval_ms = 5000
-# XXX This interval is from the end of the current frame load, which causes
-#     variance depending on how much each frame took to load, in addition it's
-#     hard to set some fps from this since it's interval+load time. Should this
-#     be from frame to frame at the risk of maybe (verify?) making the UI
-#     unresponsive because of back to back re-rendering? 
-# XXX Should this be dynamic depending on QImageReader information?
-animation_interval_ms = 100  
+# Interval between nextFrame calls. If a frame hasn't been decoded when the
+# interval expires, it will be delayed another interval
+# XXX Should this be dynamic depending on QImageReader information (eg GIF delay
+#     between frames)?
+animation_interval_ms = 50
 most_recently_used_max_count = 10
 stat_timeout_secs = 0.25
 # QApplication.keyboardInputInterval() is 400ms, which is too short
 listview_keyboard_search_timeout_secs = 0.75
+# XXX Have a config to disable placeholders to prevent flashing when browsing?
+use_image_placeholders = False
+use_thumbnail_placeholders = True
 
 
 # queue is an old style class, inherit from object to make newstyle
@@ -278,65 +397,141 @@ class Queue(queue.Queue, object):
         # Doing gets seems to be the safest and simplest way of draining the
         # queue, other ways may be faster but more brittle or more complicated
         # See https://stackoverflow.com/questions/6517953/clear-all-items-from-the-queue
+        entries = []
         try:
             while (True):
                 entry = self.get_nowait()
+                entries.append(entry)
                 info("Drained entry %.200r", entry)
         except queue.Empty:
             pass
         info("Queue.clear done")
 
+        return entries
 
-def prefetch_files(request_queue, response_queue):
-    info("prefetch_files starts")
-    while (True):
-        filepath = request_queue.get()
-        if (filepath is None):
-            response_queue.put(None)
-            break
 
-        info("worker prefetching %r", filepath)
-        # Store file contents, don't use QImage yet because:
-        # - Using QImage.load will block the GUI thread for the whole duration
-        #   of the load and conversion, which makes prefetching useless.
-        # - Just Converting to QImage here blocks the GUI thread, which makes
-        #   prefetching useless
-        # - Converting the data to QImage increases 100x fold the cache memory
-        #   footprint
-        # - Doing QImage conversion on the GUI thread is not that taxing and
-        #   doesn't stall for long
-        #
-        # Also store the file stat otherwise os.stat calls in the main thread
-        # get queued behind data requests, taking seconds, making the prefetch
-        # useless
-        try:
-            # Caller expects the original filepath in the reply (specifically,
-            # to use as the cache key), don't modify it
-            long_filepath = os_path_safelong(filepath)
+# XXX Merge FileFetcher and PixmapReader common functionality into an ancestor
+#     class QueuedTaskWorker
+
+class FileFetcher(QThread):
+    fileFetched = pyqtSignal(str, tuple)
+
+    def __init__(self, request_queue, parent=None):
+        """
+        @param parent must be not None or the thread will get garbage collected
+        """
+        super(FileFetcher, self).__init__(parent)
+        self.request_queue = request_queue
+
+    def run(self):
+        info("FileFetcher.run")
+        request_queue = self.request_queue
+        while (True):
+            data = request_queue.get()
+            if (data is None):
+                break
+
+            filepath = data
+            info("worker prefetching %r (%d in queue)", filepath, self.request_queue.qsize())
+            # Store file contents, don't use QImage yet because:
+            # - Using QImage.load will block the GUI thread for the whole duration
+            #   of the load and conversion, which makes prefetching useless.
+            # - Just Converting to QImage here blocks the GUI thread, which makes
+            #   prefetching useless
+            # - Converting the data to QImage increases 100x fold the cache memory
+            #   footprint
+            # - Doing QImage conversion on the GUI thread is not that taxing and
+            #   doesn't stall for long
+            #
+            # Also store the file stat otherwise os.stat calls in the main thread
+            # get queued behind data requests, taking seconds, making the prefetch
+            # useless
+            try:
+                # Caller expects the original filepath in the reply (specifically,
+                # to use as the cache key), don't modify it
+                long_filepath = os_path_safelong(filepath)
+                
+                t = time.time()
+                with open(long_filepath, "rb") as f:
+                    # XXX Read in chunks to reduce chance of network failures? Could
+                    #     also allow aborting to give higher prio to queued transfer
+                    #     and to report progress, but the latter would need to be
+                    #     cross-thread compatible (in some shared variable?)
+                    data = f.read()
+                t = time.time() - t
+                info("worker prefetched data in %0.2fs %0.2fKB/s %r %d in queue", t, len(data) / (t * 1024.0) if t > 0 else 0, long_filepath, self.request_queue.qsize())
+                t = time.time()
+                filestat = os.stat(long_filepath)
+                t = time.time() - t
+                info("worker prefetched stat in %0.2fs %r %d in queue", t, long_filepath, self.request_queue.qsize())
+            except:
+                # If there was an error, let the caller handle it by placing None
+                # data
+                exc("Unable to prefetch %r", long_filepath)
+                data = None
+                filestat = None
             
-            t = time.time()
-            with open(long_filepath, "rb") as f:
-                # XXX Read in chunks to reduce chance of network failures? Could
-                #     also allow aborting to give higher prio to queued transfer
-                #     and to report progress, but the latter would need to be
-                #     cross-thread compatible (in some shared variable?)
-                data = f.read()
-            t = time.time() - t
-            info("worker prefetched data in %0.2fs %0.2fKB/s %r", t, len(data) / (t * 1024.0) if t > 0 else 0, long_filepath)
-            t = time.time()
-            filestat = os.stat(long_filepath)
-            t = time.time() - t
-            info("worker prefetched stat in %0.2fs %r", t, long_filepath)
-        except:
-            # If there was an error, let the caller handle it by placing None
-            # data
-            exc("Unable to prefetch %r", long_filepath)
-            data = None
-            filestat = None
-        
-        response_queue.put((filepath, (data, filestat)))
+            self.fileFetched.emit(filepath, (data, filestat))
 
-    info("prefetch_files ends")
+        info("FileFetcher.run ends")
+
+
+class PixmapReader(QThread):
+    # XXX See https://mayaposch.wordpress.com/2011/11/01/how-to-really-truly-use-qthreads-the-full-explanation/
+    # XXX See https://stackoverflow.com/questions/10776509/qthreads-qobject-and-sleep-function
+    # XXX See https://woboq.com/blog/qthread-you-were-not-doing-so-wrong.html
+    
+    pixmapReady = pyqtSignal(str, tuple)
+    
+    def __init__(self, request_queue, parent=None):
+        """
+        @param parent must be not None or the thread will get garbage collected
+        """
+        info("PixmapReader.__init__")
+        super(PixmapReader, self).__init__(parent)
+        self.request_queue = request_queue
+        
+    def run(self):
+        info("PixmapReader.run")
+        request_queue = self.request_queue
+
+        while (True):
+            data = request_queue.get()
+            if (data is None):
+                break
+
+            filepath, (file_data, imageWidget, scale, reader) = data
+            
+            if (reader is None):
+                info("Creating reader")
+                buffer = QBuffer()
+                buffer.setData(file_data)
+                reader = qThreadSafeImageReader(buffer)
+                info("Using new reader %r", reader)
+
+            else:
+                # Note this will fail if a recycled reader is used in multiple
+                # threads simultaneously making the resulting pixmap None.
+                # Readers should only be recycled when used for different frames
+                # of the same image, but code in nextFrame prevents from queueing
+                # multiple frames for the same image, so this should be safe.
+                # XXX Prevent by having a single main image queue?
+                info("Recycling reader %r", reader)
+            info("Reading image %r %d", filepath, len(file_data or []))
+            image = reader.read()
+            info("Converting image %r", filepath)
+            pixmap = QPixmap.fromImage(image)
+            info("Scaling pixmap %r", filepath)
+            if ((not pixmap.isNull()) and (scale is not None)):
+                pixmap = pixmap.scaled(scale, 
+                    Qt.KeepAspectRatioByExpanding if (False) else Qt.KeepAspectRatio, 
+                        Qt.SmoothTransformation)
+
+            info("Emitting pixmap %r null %s error %s", filepath, pixmap.isNull(), reader.errorString())
+            
+            self.pixmapReady.emit(filepath, (pixmap, imageWidget))
+
+        info("PixmapReader.run ends")
 
 
 def split_base_index(s):
@@ -504,6 +699,10 @@ class FileDialog(QDialog):
         super(FileDialog, self).__init__(parent)
 
         self.statRequestQueue = Queue()
+        # XXX Remove response queue since with signals it's not necessary? (but
+        #     it's still used for the blocking phase of updateDirpath, until the
+        #     timer fires, and using the notify path has decreased quality like
+        #     filtering out unsupported files and sorting?)
         self.statResponseQueue = Queue()
         self.requestId = 0
 
@@ -622,11 +821,15 @@ class FileDialog(QDialog):
         info("Signaling %d fetchers to end", len(self.statFetchers))
         for fetcher in self.statFetchers:
             self.statRequestQueue.put(None)
-            entry = ""
-            while (entry is not None):
-                entry = self.statResponseQueue.get()
-                info("Drained entry %.200r", entry)
         info("Signaled")
+        # Wait for each fetcher after queing as many stop items as fetchers,
+        # can't send and wait individually since the queue is shared by fetchers
+        # and it's not deterministic which fetcher will end when
+        info("Waiting for %d fetchers to end", len(self.statFetchers))
+        for fetcher in self.statFetchers:
+            fetcher.wait()
+        info("Waited")
+        
 
     def clearQueues(self):
         """
@@ -667,7 +870,10 @@ class FileDialog(QDialog):
         # the request id
         self.clearQueues()
         
-        info("listdir")
+        # XXX Do this in a thread and block with timeout so the box can at least
+        #     be dismissed when network paths are slow?
+        # XXX Also do the stat fetching in a similar way?
+        info("listdir %r", dirpath)
         names = os.listdir(dirpath)
         info("listdired %d files", len(names))
 
@@ -733,6 +939,10 @@ class FileDialog(QDialog):
                 
                 if (is_dir):
                     dirnames.append(name)
+
+                # XXX This filter is missing when deferring because has to be
+                #     applied only to files and not dirs, reapply when the stats
+                #     come?
 
                 elif (ext.lower() in supported_extensions):
                     filenames.append(name)
@@ -1187,33 +1397,40 @@ class ImageWidget(QLabel):
             info("sizeHint %dx%d", width, height)
         
         return QSize(width, height)
-    
+
+# Image states
+# init -> loading (or queued) -> decoded (error)
+# init -> loading (or queued) -> loaded -> decoding -> decoded (or error)
+IMAGE_STATE_INIT =  0
+IMAGE_STATE_LOADING = 1
+IMAGE_STATE_LOADED = 2
+IMAGE_STATE_DECODING = 3
+IMAGE_STATE_DECODED = 4
+
 class ImageViewer(QMainWindow):
+    
     def __init__(self):
         super(ImageViewer, self).__init__()
 
         self.slideshow_timer = None
 
         self.animation_timer = None
+        self.animation_timer_start = None
         self.animation_reader = None
         # Initialize to 0 and 1 so statusbar displays 1/1 on non-animated files
         self.animation_frame = 0
         self.animation_count = 1
+        self.animation_fps = 0
 
         self.recent_filepaths = []
 
         # Use the scripts directory as FileDialog opening dir
         self.image_filepath = sys.argv[0]
-
+        
         # Thumbnail pane settings
         self.thumbnail_columns = 5
         self.thumbnail_rows = 5
         self.thumbnails_per_page = self.thumbnail_columns * self.thumbnail_rows
-
-        # Cache of recently generated thumbnails, currently only the ones in
-        # the current pane
-        self.filepath_to_thumbnail_pixmap = dict()
-
         self.cached_files = []
         # XXX This could have a max_size_bytes instead
         # XXX This is x2 because the cache has +- around the current image, 
@@ -1221,21 +1438,124 @@ class ImageViewer(QMainWindow):
         self.cached_files_max_count = self.thumbnails_per_page * 2 + 2
 
         self.prefetch_request_queue = Queue()
-        self.prefetch_response_queue = Queue()
         # XXX Check any relationship between prefetch and cache counts, looks
         #     like there shouldn't be any even if the current is evicted from
-        #     lur since the current is also kept separately? (although prefetch
+        #     lru since the current is also kept separately? (although prefetch
         #     > cache is probably silly)
         # XXX The "browse direction" cache should be larger than the opposite
         #     direction cache? (eg have more files forward if browsing forward)
         #     otherwise the cache is halved with typical forward browsing
         self.prefetched_images_max_count = self.thumbnails_per_page * 2
         self.prefetch_pending = set()
-        self.prefetcher_count = 4
+        self.prefetcher_count = 2
 
-        for i in xrange(self.prefetcher_count):
-            thread.start_new_thread(prefetch_files, (self.prefetch_request_queue, self.prefetch_response_queue))
+        self.decoder_request_queue = Queue()
+        self.decoder_count = multiprocessing.cpu_count()
         
+        def receive_file(filepath, data):
+            for thumbWidget in self.thumbWidgets:
+                if ((filepath == thumbWidget.image_filepath) and 
+                    # Ignore if the thumbnail already has the right image XXX
+                    # Why do images come for thumbnails that already have
+                    # decoded the image, cache too small? multiple thumbs with
+                    # the same image? investigate? Looks like as gotoImage is
+                    # called, new prefetches can evict the thumbnails?
+                    (thumbWidget.image_state <= IMAGE_STATE_LOADING)):
+                    thumbWidget.image_state = IMAGE_STATE_LOADED
+                    thumbWidget.image_data = data
+                    
+            self.prefetch_pending.discard(filepath)
+            # Note this evicts and inserts even if the file is invalid, which 
+            # is good since it won't try to fetch the file again. If the problem
+            # is transient, the user can reload manually
+            if (len(self.cached_files) >= self.cached_files_max_count):
+                info("evicting %r for %r", self.cached_files[-1][0], filepath)
+                self.cached_files.pop(-1)
+            info("inserting in cache %r", filepath)
+            self.cached_files.insert(0, (filepath, data))
+            info("inserted in cache %r", filepath)
+            if (self.image_filepath == filepath):
+                self.updateImageData(filepath, None, data)
+            
+            self.updateThumbnails()
+            self.updateStatus()
+
+        def receive_image(filepath, pixmap, imageWidget):
+            info("Receiving pixmap %r", filepath)
+
+            if (filepath != self.image_filepath):
+                info("Main image changed after decoding, ignoring %r vs. %r", filepath, self.image_filepath)
+                return
+
+            self.clearMessage()
+            info("Decoded %r %dx%d", filepath, pixmap.width(), pixmap.height())
+        
+            imageWidget.image_state = IMAGE_STATE_DECODED
+            if (pixmap.isNull()):
+                # XXX This should turn animation off if enabled, otherwise will
+                #     cause infinite dialog boxes? Animation won't be enabled if
+                #     the file failed to read, but it Could happen if the file
+                #     was read and some middle frame is corrupt?
+                warn("Invalid image file %r", filepath)
+                QMessageBox.information(self, "Image Viewer",
+                    "Invalid image file %s." % filepath)
+                pixmap = self.errorPixmap
+                
+            # XXX Is this image to pixmap to setpixmap redundant? should we use image?
+            #     or pixmap?
+            self.imageWidget.setPixmap(pixmap)
+
+            if ((self.animation_timer is not None) and (self.animationAct.isChecked())):
+                new_report_time = time.time()
+                self.animation_fps = (1.0 / ((new_report_time - self.animation_report_time) or 1.0))
+                self.animation_report_time = new_report_time
+
+            self.updateImage()
+            self.updateStatus()
+            self.updateActions()
+
+        def receive_thumbnail(filepath, pixmap, thumbWidget):
+            info("Receiving pixmap %r", filepath)
+            
+            # Ignore if this thumbnail no longer shows this filepath,
+            # leave whatever state
+            if (thumbWidget.image_filepath != filepath):
+                return
+
+            thumbWidget.image_state = IMAGE_STATE_DECODED
+            if (pixmap.isNull()):
+                pixmap = self.errorPixmap
+            thumbWidget.setPixmap(pixmap)
+            thumbWidget.resizePixmap(thumbWidget.size())
+
+        def receive_pixmap(filepath, payload):
+            pixmap, imageWidget = payload
+            if (imageWidget is self.imageWidget):
+                receive_image(filepath, pixmap, imageWidget)
+            else:
+                receive_thumbnail(filepath, pixmap, imageWidget)
+
+        # XXX To use a threadpool needs to be a qrunnable but qrunnables are not
+        #     qobjects so they cannot send signals, so the qrunnable needs to
+        #     inherit from both qrunnable and qobject or to be passed some
+        #     sacrificial qobject to emit on
+        # QThreadPool.globalInstance().start(t)
+        # threads.append(t)
+
+        # Create prefetcher threads and pool them via the prefetch_request_queue
+        for i in xrange(self.prefetcher_count):
+            info("Creating file fetcher %d", i)
+            t = FileFetcher(self.prefetch_request_queue, self)
+            t.fileFetched.connect(receive_file)
+            t.start()
+
+        # Create decoder threads and pool them via the decoder_request_queue
+        for i in xrange(self.decoder_count):
+            info("Creating pixmap decoder %d", i)
+            t = PixmapReader(self.decoder_request_queue, self)
+            t.pixmapReady.connect(receive_pixmap)
+            t.start()
+
         w = QWidget(self)
         self.setCentralWidget(w)
         hl = QHBoxLayout()
@@ -1259,13 +1579,16 @@ class ImageViewer(QMainWindow):
         for i in xrange(self.thumbnails_per_page):
             col = i % self.thumbnail_columns
             row = i / self.thumbnail_columns
-            im = ImageWidget()
-            gl.addWidget(im, row, col)
+            thumbWidget = ImageWidget()
+            thumbWidget.image_state = IMAGE_STATE_INIT
+            thumbWidget.image_data = None
+            thumbWidget.image_filepath = None
+            gl.addWidget(thumbWidget, row, col)
             gl.setRowStretch(row, 1)
             gl.setRowMinimumHeight(row, 50)
             gl.setColumnStretch(col, 1)
             gl.setColumnMinimumWidth(col, 50)
-            self.thumbWidgets.append(im)
+            self.thumbWidgets.append(thumbWidget)
             # XXX Missing connecting button click to changing main image and
             #     focusing cell
             
@@ -1276,6 +1599,7 @@ class ImageViewer(QMainWindow):
         imageWidget = ImageWidget()
         imageWidget.setMouseTracking(True)
         imageWidget.installEventFilter(self)
+        imageWidget.image_state = IMAGE_STATE_INIT
         self.imageWidget = imageWidget
 
         splitter.addWidget(imageWidget)
@@ -1286,13 +1610,24 @@ class ImageViewer(QMainWindow):
         # XXX Should probably use whatever background color the grid has?
         self.emptyPixmap.fill(Qt.white)
 
-        self.loadingPixmap = QPixmap(10, 10)
+        self.queuedPixmap = QPixmap(10, 10)
         # XXX Should refresh on changes to background color?
-        self.loadingPixmap.fill(self.imageWidget.backgroundColor)
+        self.queuedPixmap.fill(self.imageWidget.backgroundColor)
+
+        self.loadingPixmap = QPixmap(10, 10)
+        self.loadingPixmap.fill(Qt.blue)
+        
+        self.decodingPixmap = QPixmap(10, 10)
+        self.decodingPixmap.fill(Qt.magenta)
+
+        self.queuedDecodingPixmap = QPixmap(10, 10)
+        self.queuedDecodingPixmap.fill(Qt.yellow)
 
         self.errorPixmap = QPixmap(10, 10)
         self.errorPixmap.fill(Qt.red)
 
+        # Initialize for the first time while waiting to load
+        self.imageWidget.setPixmap(self.loadingPixmap)
 
         self.createActions()
         self.createMenus()
@@ -1311,6 +1646,9 @@ class ImageViewer(QMainWindow):
 
         if (filepath is not None):
             self.loadImage(filepath)
+            # XXX Actions are disabled by default, this is needed so shortcut
+            #     keys work before updateimagedata is called, move elsewhere?
+            self.updateActions()
             self.setRecentFile(filepath)
         
         # show() in order to initialize frameGeometry()
@@ -1332,44 +1670,49 @@ class ImageViewer(QMainWindow):
         self.move(ag.topLeft())
         self.resize(width - frame_width, height - frame_height)
 
-        # XXX Thumbnails should be updated only when needed, ie when navigating
-        #     or when new thumbnails have finished loading, without need for a
-        #     timer, but that requires a QT thread blocking on the prefetch
-        #     thread, since the prefetch thread is currently a python thread and
-        #     cannot send Qt signals (or convert the prefetch thread to QT, but
-        #     needs to check it releases the GIL when necessary)
-        self.updateThumbnailsTimer = QTimer(self)
-        self.updateThumbnailsTimer.timeout.connect(self.updateThumbnails)
-        self.updateThumbnailsTimer.start(1000) 
-
     def clearRequests(self):
         info("clearRequests")
 
         info("Clearing requests")
-        # These need to be cleared manually since they need to be removed from 
-        # prefetch_pending
-        try:
-            filepath = self.prefetch_request_queue.get_nowait()
-            info("cleared request for %r", filepath)
-            self.prefetch_pending.remove(filepath)
-
-        except queue.Empty:
-            pass
+        entries = self.prefetch_request_queue.clear()
+        self.prefetch_pending -= set(entries)
+        info("removing %d stale prefetch requests", len(entries))
+        # XXX This could just set all pending thumbWidgets to INIT? (but may be
+        #     too conservative for files that were read just before clearing?)
+        entries = set(entries)
+        for thumbWidget in self.thumbWidgets:
+            if ((thumbWidget.image_filepath in entries) and 
+                (thumbWidget.image_state == IMAGE_STATE_LOADING)):
+                thumbWidget.image_state = IMAGE_STATE_INIT
+                    
+        entries =[fp for (fp, payload) in self.decoder_request_queue.clear()]
+        info("removing %d stale decode requests", len(entries))
+        entries = set(entries)
+        for thumbWidget in self.thumbWidgets:
+            if ((thumbWidget.image_filepath in entries) and 
+                (thumbWidget.image_state == IMAGE_STATE_DECODING)):
+                thumbWidget.image_state = IMAGE_STATE_LOADED
         info("Cleared requests")
         
 
     def clearQueues(self):
         info("clearQueues")
         self.prefetch_request_queue.clear()
-        self.prefetch_response_queue.clear()
         self.prefetch_pending.clear()
+
+        self.decoder_request_queue.clear()
 
     def cleanup(self):
         info("Signaling %d prefetchers to end", self.prefetcher_count)
         for _ in xrange(self.prefetcher_count):
             self.prefetch_request_queue.put(None)
-            self.prefetch_response_queue.get()
-        info("Signaled")
+            # XXX Missing .wait the QThread, but they are not stored anywhere?
+        info("Signaled prefetchers")
+        info("Signaling %d decoders to end", self.prefetcher_count)
+        for _ in xrange(self.decoder_count):
+            self.decoder_request_queue.put(None)
+            # XXX Missing .wait the QThread, but they are not stored anywhere?
+        info("Signaled decoders")
         
     def closeEvent(self, event):
         info("closeEvent")
@@ -1395,18 +1738,28 @@ class ImageViewer(QMainWindow):
         filepath = None
         if (self.slideshow_timer is not None):
             self.slideshow_timer.stop()
-        
+
+        restore_animation = False
         if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
-            self.animation_timer.stop()
-        
+            restore_animation = True
+            self.animationAct.setChecked(False)
+            
         # Remove prefetches that haven't been serviced yet to prevent prefetches
         # fighting for filesystem bandwidth with the filedialog list and stat
         # (note the prefetches in flight will still be serviced and put in the
         # reponse queue)
+        # XXX Ideally pause/stop/abort in flight too?
+        # Reset image_filepaths so updatethumbnails stops requesting images
+        # XXX Also do something so in flight requests don't start decoding threads?
+        # XXX Stopping requests this way is kludgy, should have some background
+        #     task enabled flag that is checked in multiple places?
+        filepaths = self.image_filepaths
+        self.image_filepaths = None
         self.clearRequests()
 
         dirpath = os.path.curdir if self.image_filepath is None else self.image_filepath
-        if (False):
+        use_native_dialog = False
+        if (use_native_dialog):
             filepath, _ = QFileDialog.getOpenFileName(self, "Open File", dirpath)
 
             if (filepath == ""):
@@ -1415,13 +1768,18 @@ class ImageViewer(QMainWindow):
         else:
             dlg = FileDialog(dirpath, self)
             if (dlg.exec_() == QDialog.Accepted):
+                # XXX Should set all thumbnails to INIT?
                 filepath = dlg.chosenFilepath
-
+            else:
+                # Restore image_filepaths and force request any necessary images
+                self.image_filepaths = filepaths
+                self.gotoImage(0)
+                
         # Restart the animation timer if it was running, if the new image is
         # loaded and found not to have animations, the timer will be stopped
         # there
-        if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
-            self.animation_timer.start(animation_interval_ms)
+        if (restore_animation):
+            self.animationAct.setChecked(True)
 
         if (self.slideshow_timer is not None):
             self.slideshow_timer.start(slideshow_interval_ms)
@@ -1512,14 +1870,14 @@ class ImageViewer(QMainWindow):
         #     clipboard?
         #     clipboard.setPixmap(self.imageWidget.originalPixmap)
         #     See https://www.qtcentre.org/threads/39887-QMimeData-using-setText-and-setUrls-at-the-same-time
-        
 
-    def getDataFromCache(self, filepath, block=True):
+
+    def getDataFromCache(self, filepath, clear=False):
         """
         @return 
         - bytes if image in cache and didn't fail to load
         - None if image in cache and failed to load
-        - None if image not in cache and block=False
+        - False if image not in cache
         """
         assert isinstance(filepath, unicode) 
         # XXX Qt already has QPixmapCache, look into it?
@@ -1530,6 +1888,7 @@ class ImageViewer(QMainWindow):
         # XXX Use a set/dict/ordereddict for this test
         try:
             filepaths = [entry_filepath for entry_filepath, entry_data in self.cached_files]
+            dbg("filepaths in cache %r", filepaths)
             i = filepaths.index(filepath)
             info("cache hit for %r", filepath)
             entry = self.cached_files[i]
@@ -1541,7 +1900,7 @@ class ImageViewer(QMainWindow):
         except ValueError:
             info("cache miss for %r", filepath)
 
-            if (block):
+            if (clear):
                 # Empty the request queues so:
                 # - this image request takes higher priority
                 # - stale prefetches around this image don't accumulate (ok
@@ -1563,8 +1922,8 @@ class ImageViewer(QMainWindow):
                 #     reading the main image is non-blocking, should probably be
                 #     moved elsewhere, in gotoImage, etc?
 
-                self.prefetch_request_queue.clear()
-                info("removed ~%d stale requests", len(self.prefetch_pending))
+                entries = self.prefetch_request_queue.clear()
+                info("removing %d stale prefetch requests", len(entries))
                 # Note clearing the prefetch_pending set here may cause the
                 # prefetch_pending set to get out of sync wrt
                 # prefetch_response_queue: a prefetch request may be serviced by
@@ -1574,9 +1933,29 @@ class ImageViewer(QMainWindow):
                 # cleared here. This is ok since this thread .discards items
                 # from the set instead of .removing them, and .discard doesn't
                 # require the item to be in the set
-                
-                self.prefetch_pending.clear()
 
+                # Only remove entries that were cleared, otherwise entries that
+                # are currently being downloaded could be downloaded twice
+                self.prefetch_pending -= set(entries)
+                # XXX Handling the thumbnail state here is not very clean, find
+                #     another place to do it?
+                # XXX This could just set all pending thumbWidgets to INIT? (but
+                #     may be too conservative for files that were read just
+                #     before clearing?)
+                entries = set(entries)
+                for thumbWidget in self.thumbWidgets:
+                    if ((thumbWidget.image_filepath in entries) and 
+                        (thumbWidget.image_state == IMAGE_STATE_LOADING)):
+                        thumbWidget.image_state = IMAGE_STATE_INIT
+                
+                entries =[fp for (fp, _, _, _, _) in self.decoder_request_queue.clear()]
+                info("removing %d stale decode requests", len(entries))
+                entries = set(entries)
+                for thumbWidget in self.thumbWidgets:
+                    if ((thumbWidget.image_filepath in entries) and 
+                        (thumbWidget.image_state == IMAGE_STATE_DECODING)):
+                        thumbWidget.image_state = IMAGE_STATE_LOADED
+                    
             # The filepath is not in the cache, request if not already pending
             if (filepath not in self.prefetch_pending):
                 info("prefetch pending miss for %r", filepath)
@@ -1587,70 +1966,30 @@ class ImageViewer(QMainWindow):
             else:
                 info("prefetch pending hit for %r", filepath)
 
-                
-            # Drain the requests as they are satisfied until the requested one
-            # is found. Note this won't be in order if there are more than one
-            # prefetcher threads
-            while (True):
-                # info("Popping prefetch response queue for %r", filepath)
-                try:
-                    entry_filepath, entry_data = self.prefetch_response_queue.get(block)
-                except queue.Empty:
-                    # Not blocking and no more items, return None, item was put
-                    # in the prefetch request queue, but caller will need to
-                    # call again until it appears in the prefetch response queue
-                    entry_filepath = None
-                    entry_data = None
-                    break
-                info("Popped prefetch response queue %r for %r", entry_filepath, filepath)
-                
-                # prefetch_pending may be out of sync with
-                # prefetch_response_queue when the  prefetch_pending set is
-                # cleared above to give higher priority to more recent requests.
-                # In that case this filepath may not be in the prefetch_pending
-                # set because it was processed by the prefetch thread before the
-                # prefetch request queue was cleared. Use .discard instead of
-                # .remove, which doesn't require the item to be in the set, to
-                # account for that.
-                self.prefetch_pending.discard(entry_filepath)
-
-                if (entry_data is not None):
-                    if (len(self.cached_files) >= self.cached_files_max_count):
-                        info("evicting %r for %r", self.cached_files[-1][0], filepath)
-                        self.cached_files.pop(-1)
-                    info("inserting in cache %r", entry_filepath)
-                    self.cached_files.insert(0, (entry_filepath, entry_data))
-                    info("inserted in cache %r", entry_filepath)
-                    
-                if (entry_filepath == filepath):
-                    break
+            entry_data = False
 
         return entry_data
 
-
     def updateThumbnails(self):
-        dbg("updateThumbnails")
+        info("updateThumbnails")
         if (not self.thumbnailsWidget.isVisible()):
             return
             
         filepaths = self.image_filepaths
         if (filepaths is None):
-            return
-
-        if (not self.updateThumbnailsTimer.isActive()):
-            # Don't reenter this function, can happen when called from
-            # QApplication.processEvents() below
-            return
-
-        # Stop the timer so multiple timer triggers are not queued if this code
-        # takes more than the interval to run, restart the timer at the end.
-        # Making the timer inactive also allows detecting reentrance into this
-        # function, used above
-        self.updateThumbnailsTimer.stop()
-
+            # When a single image was loaded, only show that image in the
+            # thumbnails (until the thumnbails are navigated and filepaths
+            # populated)
+            # XXX This is also hit when askForFilepath aborts outstanding
+            #     requests, fix?
+            filepaths = [self.image_filepath]
+            
         # Collect the filepaths in this thumbnail page. Account for more
         # thumbnail slots than filepaths or viceversa
         try:
+            # XXX This fails if thumbnails have the same path, can happen with
+            #     .lst files with repeated entries, support or filter at .lst
+            #     load time?
             i = filepaths.index(self.image_filepath)
             page = i / self.thumbnails_per_page
             i = page*self.thumbnails_per_page
@@ -1659,82 +1998,82 @@ class ImageViewer(QMainWindow):
             filepaths = self.image_filepaths[:self.thumbnails_per_page]
 
         # Fill the thumbnail slots with the appropriate image: filepath image,
-        # loading image, failed image, or empty image
-        restore_cursor = False
-        for filepath, thumbWidget in zip(filepaths, self.thumbWidgets[:len(filepaths)]):
-            scaled_pixmap = self.filepath_to_thumbnail_pixmap.get(filepath, None)
-            if ((scaled_pixmap != thumbWidget.originalPixmap) or (scaled_pixmap is None)):
-                if (scaled_pixmap is None):
-                    entry = self.getDataFromCache(filepath, False)
-                    # XXX this cannot tell if the image failed to load,
-                    #     getDataFromCache should return false instead of None
-                    #     in that case?
-                    if (entry is None):
-                        if (thumbWidget.originalPixmap != self.loadingPixmap):
-                            scaled_pixmap = self.loadingPixmap
-                        else:
-                            # Don't cause continuous creation until found
-                            continue
-                    else:
-                        info("Setting thumbnail %r", filepath)
-                        file_data, file_stat = entry
-                        buffer = QBuffer()
-                        buffer.setData(file_data)
-                        buffer.open(QIODevice.ReadOnly)
-                        reader = QImageReader(buffer)
-                        # XXX Reading seems to take the most time, especially
-                        #     for svg, should happen on a QT thread but to be
-                        #     worth it need to check that it releases the GIL.
-                        #     May also need some hysteresis/queue purging in
-                        #     case keyboard movement is way ahead of the reader
-                        #     thread and check that the read image is still the
-                        #     one being displayed
-                        info("Reading thumbnail %r", filepath)
-                        if (not restore_cursor):
-                            QApplication.setOverrideCursor(Qt.WaitCursor)
-                            restore_cursor = True
-                        image = reader.read()
-                        if (image.isNull()):
-                            pixmap = self.errorPixmap
+        # loading image, decoding image, failed image, or empty image
+        for i, filepath in enumerate(filepaths):
+            thumbWidget = self.thumbWidgets[i]
+            scaled_pixmap = thumbWidget.originalPixmap
+            
+            if (thumbWidget.image_filepath != filepath):
+                thumbWidget.image_state = IMAGE_STATE_INIT
+                thumbWidget.image_data = None
+            
+            # State switch from INIT to LOADING, set the placeholder pixmap to
+            # loading/queued if INIT or LOADING ,and state switch to LOADED if
+            # done LOADING
+            if ((thumbWidget.image_state == IMAGE_STATE_INIT) or 
+                (thumbWidget.image_state == IMAGE_STATE_LOADING)):
+                # XXX Should this be done unconditionally outside so the LRU
+                #     cache is primed? This may cause fighting with the prefetch
+                #     if the prefetch count is improperly set wrt the number of
+                #     thumbnails. Does an LRU cache make any sense when the
+                #     cache is properly sized wrt thumbnails and prefetch?
+                entry = self.getDataFromCache(filepath)
+                # XXX Checking the internal queue member variable is not nice,
+                #     but it's only used for UI status and not worth doing
+                #     something thread-safe that is going to be racy anyway?
+                #     Note this doesn't trigger "deque mutated during iteration"
+                #     exception because "in" is atomic from GIL point of view
+                if (use_thumbnail_placeholders):
+                    scaled_pixmap = self.queuedPixmap if filepath in self.prefetch_request_queue.queue else self.loadingPixmap
+                
+                if (entry is False):
+                    # Note there's no race condition here between getDataFromCache
+                    # request finishing before this state is set, because the 
+                    # state is only modified on this thread and this thread is
+                    # still busy
+                    thumbWidget.image_state = IMAGE_STATE_LOADING
+                    
+                else:
+                    thumbWidget.image_state = IMAGE_STATE_LOADED
+                    # It can happen that by the time this is fetched, dealing
+                    # with _LOADED the data may not be in the cache anymore, so
+                    # store it in thumbWidget.image_data
+                    thumbWidget.image_data = entry
 
-                        else:
-                            pixmap = QPixmap.fromImage(image)
+            if (thumbWidget.image_state == IMAGE_STATE_LOADED):
+                entry = thumbWidget.image_data
+                # XXX This needs to check for null entry if it failed to load?
+                file_data, file_stat = entry
+                info("Requesting thumbnail %r", filepath)
+                    
+                if (use_thumbnail_placeholders):
+                    scaled_pixmap = self.decodingPixmap
+                thumbWidget.image_state = IMAGE_STATE_DECODING
 
-                        # This could use the thumbWidget.size() but then it
-                        # needs refreshing when the splitter changes
-                        # XXX Use screen DPI to calculate the best thumbnail size?
-                        info("Scaling thumbnail %r", filepath)
-                        scaled_pixmap = pixmap.scaled(150, 150, 
-                            Qt.KeepAspectRatioByExpanding if (False) else Qt.KeepAspectRatio, 
-                            Qt.SmoothTransformation)
+                # This could use the thumbWidget.size() but then it
+                # needs refreshing when the splitter changes
+                # XXX Use screen DPI to calculate the best thumbnail size?
+                # Note it's ok for this request to race the setPixmap below
+                # since the response is handled in this thread so it's not racy
+                self.decoder_request_queue.put((filepath, (file_data, thumbWidget, QSize(150, 150), None)))
 
-                        self.filepath_to_thumbnail_pixmap[filepath] = scaled_pixmap
+            if (thumbWidget.image_state == IMAGE_STATE_DECODING):
+                # XXX Checking the internal queue member variable is not nice,
+                #     but it's only used for UI status and not worth doing
+                #     something thread-safe that is going to be racy anyway?
+                # XXX Without converting to list, this can return deque mutated
+                #     during iteration?
+                if (use_thumbnail_placeholders):
+                    q = list(self.decoder_request_queue.queue)
+                    scaled_pixmap = self.queuedDecodingPixmap if any([(filepath == fp) for (fp, payload) in q]) else self.decodingPixmap
 
-                        info("Set thumbnail %r", filepath)
-
+            # Don't cause continuous bitmap setting if already set
+            if (scaled_pixmap is not thumbWidget.originalPixmap):
+                info("Setting thumbnail %r", filepath)
                 thumbWidget.setPixmap(scaled_pixmap)
                 # XXX Can the grid be updated instead of each individual imagewidget?
                 thumbWidget.resizePixmap(thumbWidget.size())
-                # reader.erad() above can take some time, update the UI. This
-                # allows the UI to update before loading the thumbnails,
-                # otherwise the UI feels unresponsive when gotoImage is called
-                # when toggling the thumbnails and the thumbnail grid doesn't
-                # appear. Another option is to Timer.singleShot(700,
-                # self.updateThumbnails) But the time required so the UI is
-                # updated before updateThumbnails blocks the UI seems to be
-                # greater than 500 and lower than 1000
-                # XXX When switching thumbnail pages, this shows the old
-                #     thumbnails until the new ones are loaded, do a first pass
-                #     setting all thumbs to loading?
-                # XXX The focus rectangle may be moved in the processEvents
-                #     below but the UI won't sync until this updateThumbnails is
-                #     done, which can cause two focus rectangles or none. Sync
-                #     the focus rectangle independently from updateThumbnails?
-                # XXX The above issues would get fixed by doing proper async
-                #     reader.read in a QThread instead, assuming it releases the
-                #     GIL?
-                QApplication.processEvents()
-
+                
             # Set the current thumbnail rectangle and background or remove it 
             # in case it was previously set
             if (filepath == self.image_filepath):
@@ -1746,10 +2085,19 @@ class ImageViewer(QMainWindow):
                 #     background color?
                 thumbWidget.setBackgroundColor(Qt.darkGray)
                 thumbWidget.setBorder(0)
+
+            thumbWidget.image_filepath = filepath
         
-        # Set all unused thumnail slots to empty
+        # Set all unused thumbnail slots to empty
         for i in xrange(len(self.thumbWidgets)-len(filepaths)):
             thumbWidget = self.thumbWidgets[len(filepaths)+i]
+            # XXX This unnecessarily sets the thumbnail state that is probably
+            #     already set and relies on checking originalPixmap to avoid
+            #     repaints, should there be an empty state or set them to
+            #     DECODED and look at the filepath to tell between empty and ?
+            thumbWidget.image_filepath = None
+            thumbWidget.image_state = IMAGE_STATE_INIT
+            thumbWidget.image_data = None
             if (thumbWidget.originalPixmap is not self.emptyPixmap):
                 thumbWidget.setPixmap(self.emptyPixmap)
                 thumbWidget.setBackgroundColor(Qt.white)
@@ -1757,22 +2105,8 @@ class ImageViewer(QMainWindow):
                 # Force a repaint since the pixmap was changed
                 thumbWidget.resizePixmap(thumbWidget.size())
 
-        # Cleanup filepath_to_thumbnail_pixmap
-        # XXX This removes all thumbnail pixmaps for the previous and next 
-        #     thumbnail pages, have a variable number of thumbnail pixmaps cached?
-        # XXX Also cleanup filepath_to_thumbnail_pixmap and the thumbWidgets
-        #     when caches are cleared? (open new dir, etc)
-        for filepath in set(self.filepath_to_thumbnail_pixmap.keys()).difference(filepaths):
-            info("Removing stale thumbnail pixmap for %s", filepath)
-            del self.filepath_to_thumbnail_pixmap[filepath]
-
-        self.updateThumbnailsTimer.start()
-
-        if (restore_cursor):
-            QApplication.restoreOverrideCursor()
-            
     def loadImage(self, filepath, index = None, count = None, frame = None):
-        info("loadImage %r %s %s", filepath, index, count)
+        info("loadImage %r i %s c %s f %s", filepath, index, count, frame)
         info("Supported extensions %s", supported_extensions)
         assert isinstance(filepath, unicode) 
         if (filepath.lower().endswith(".lst")):
@@ -1789,6 +2123,7 @@ class ImageViewer(QMainWindow):
                 exc("Unable to read %s", long_filepath)
             
             if (len(filepaths) == 0):
+                # XXX Missing setting failed image
                 QMessageBox.information(self, "Image Viewer",
                     "Cannot load %s." % lst_filepath)
                 return
@@ -1835,43 +2170,72 @@ class ImageViewer(QMainWindow):
             self.nextImageAct.setEnabled(True)
             self.slideshowAct.setEnabled(True)
 
+        self.image_filepath = filepath
+        self.imageWidget.image_state = IMAGE_STATE_INIT
+
         info("Caching %r", filepath)
         self.showMessage("Loading...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        data = self.getDataFromCache(filepath)
-        QApplication.restoreOverrideCursor()
-        info("Cached %r", filepath)
+        self.imageWidget.image_state = IMAGE_STATE_LOADING
+        data = self.getDataFromCache(filepath, clear=True)
+        
+        # XXX Unify the path so it always goes through the FileFetcher thread
+        #     even if the data is in the cache?
+        if (data is not False):
+            self.imageWidget.image_state = IMAGE_STATE_LOADED
+            self.updateImageData(filepath, frame, data)
+
+        else:
+            if (use_image_placeholders):
+                self.imageWidget.setPixmap(self.loadingPixmap)
+            self.updateImage()
+            self.updateThumbnails()
+
+        self.updateStatus()
+
+    def updateImageData(self, filepath, frame, data):
+        info("updateImageData %r", filepath)
         if (data is None):
             QMessageBox.information(self, "Image Viewer",
                 "Cannot load %s." % filepath)
-            image = None
+            pixmap = self.errorPixmap
             
         else:
+            if (use_image_placeholders):
+                pixmap = self.decodingPixmap
+            else:
+                pixmap = self.imageWidget.originalPixmap
             file_data, file_stat = data
 
-            info("QImaging %r", filepath)
-            self.showMessage("Converting...")
-            QApplication.setOverrideCursor(Qt.WaitCursor)
+            if (file_data is None):
+                # setData needs a bytearray, not a list
+                # XXX review file_data uses, find the best place to detect None
+                #     file_data?
+                file_data = ""
 
+            info("Decoding %r", filepath)
+            self.showMessage("Decoding...")
+            
             # If this is not a sequential frame or there's no exising reader,
             # create a new reader
             if (
                 (self.animation_reader is None) or 
-                ((frame is None) or
-                 ((frame != (self.animation_frame + 1)) or
-                  (frame >= self.animation_reader.imageCount()))
-                )
+                (frame is None) or
+                (frame != (self.animation_frame + 1)) or
+                (frame >= self.animation_reader.imageCount())
                 ):
+
+                # If animating, don't use placeholders to avoid flashing
+                if (self.animation_count > 1):
+                    pixmap = self.imageWidget.originalPixmap
 
                 # This can be using a new reader because 
                 # 1) It's a new file
                 # 2) It requested an out of order frame (including the first frame)
-                info("Using new reader")
-
+                info("Using new reader for %d bytes", len(file_data))
                 buffer = QBuffer()
                 buffer.setData(file_data)
-                buffer.open(QIODevice.ReadOnly)
-                reader = QImageReader(buffer)
+                reader = qThreadSafeImageReader(buffer)
+                info("Created reader %r", reader)
                 # XXX Missing rotating images using the EXIF information
                 #     QImageReader.setAutoTransform is Qt 5.5, but 5.3.1 is the
                 #     one on pip Windows 10 
@@ -1879,8 +2243,11 @@ class ImageViewer(QMainWindow):
                 #     Install from git instead of pip which has Qt 5.7.1? 
                 #     See https://github.com/pyqt/python-qt5
                 #     XP from Anaconda has Qt 5.6 and Linux from apt has Qt 5.11 
+                # XXX Or use pillow
+                # XXX Or use native (see chatgpt: APP1 marker, orientation tag 0x0112)
 
                 if (reader.imageCount() > 1):
+                    # XXX Get other from reader.loopCount(), reader.nextImageDelay()
                     # This image has animations and we are using a new reader,
                     # initialize animation machinery
                     if (self.animation_timer is None):
@@ -1888,17 +2255,17 @@ class ImageViewer(QMainWindow):
                         timer.timeout.connect(self.nextFrame)
                         timer.setSingleShot(True)
                         self.animation_timer = timer
+                        self.animation_timer_start = self.animation_timer
+                        timer.start(animation_interval_ms)
 
-                    elif (self.animationAct.isChecked()):
+                    elif (not self.animationAct.isChecked()):
                         self.animation_timer.stop()
                     
                     self.animation_report_time = 0.0
                     self.animation_frame = 0
                     self.animation_count = reader.imageCount()
                     self.animation_reader = reader
-                    # This needs to be kept around or PyQt will crash
-                    self.animation_buffer = buffer
-
+                    
                     if (frame is not None):
                         # This is a non-sequential frame, advance as many frames
                         # as necessary by reading, since QGIFHandler doesn't
@@ -1906,17 +2273,15 @@ class ImageViewer(QMainWindow):
                         # See https://code.woboq.org/qt5/qtbase/src/plugins/imageformats/gif/qgifhandler.cpp.html
                         frame = frame % reader.imageCount()
                         for _ in xrange(frame-1):
-                            # QGIFHandler doesn't support jumpToNextImage or
-                            # jumpToImage, discard the frames sequentially
                             reader.read()
                         self.animation_frame = frame
 
                 elif (self.animation_reader is not None):
                     # No animations in this image but the previous image had,
                     # cleanup animation machinery
+                    info("Cleaning up animation machinery")
                     assert frame is None
                     self.animation_reader = None
-                    self.animation_buffer = None
                     if (self.animationAct.isChecked()):
                         self.animation_timer.stop()
                     self.animation_timer = None
@@ -1924,84 +2289,48 @@ class ImageViewer(QMainWindow):
                     self.animation_frame = 0
             
             else:
-                info("Recycling reader")
+                info("Recycling reader %r", self.animation_reader)
                 reader = self.animation_reader
-                buffer = self.animation_buffer
                 self.animation_frame = frame
-            
-            info("frame %s/%d tell %d", frame, reader.imageCount(), buffer.pos())
 
-            # XXX Reading seems to take the most time, especially for svg,
-            #     should happen on a QT thread but needs to check that it
-            #     releases the GIL. May also need some hysteresis/queue purging
-            #     in case keyboard movement is way ahead of the reader thread
-            #     and check that the read image is still the one being displayed
-            info("reading image %r", filepath)
-            image = reader.read()
+                if (self.animation_count > 1):
+                    # Showing the decoding pixmap makes animation flash, keep
+                    # the old pixmap while decoding on the second and successive
+                    # frames
+                    # XXX Do this also when looping?
+                    pixmap = self.imageWidget.originalPixmap
 
-            if ((self.animation_timer is not None) and (self.animationAct.isChecked())):
-                self.animation_timer.start(animation_interval_ms)
-                    
-            QApplication.restoreOverrideCursor()
-            self.clearMessage()
-            info("QImaged %r format %s", filepath, image.format())
+        if (pixmap is not self.imageWidget.originalPixmap):
+            self.imageWidget.setPixmap(pixmap)
+            self.updateImage()
         
-            if (image.isNull()):
-                QMessageBox.information(self, "Image Viewer",
-                        "Invalid image file %s." % filepath)
-                image = None
+        if (data is None):
+            # Unable to read file, pixmap was set to error, nothing more to be
+            # done, set the state to DECODED
+            self.imageWidget.image_state = IMAGE_STATE_DECODED
 
-        if (image is None):
-            # Create a dummy image, this is the easiest way of preventing
-            # exceptions everywhere when an invalid file is encountered
-            # (prev/next navigation, etc)
-            file_data = []
-            file_stat = None
-            pixmap = self.errorPixmap
-        
         else:
-            pixmap = QPixmap.fromImage(image)
+            # Reading takes the most time, especially for svg, queue on a QT
+            # thread (verified it releases the GIL)
+            
+            # XXX This is replicated in getDataFromCache, refactor?
+            entries =[fp for (fp, payload) in self.decoder_request_queue.clear()]
+            info("removing ~%d stale decode requests", len(entries))
+            entries = set(entries)
+            for thumbWidget in self.thumbWidgets:
+                if ((thumbWidget.image_filepath in entries) and 
+                    (thumbWidget.image_state == IMAGE_STATE_DECODING)):
+                    thumbWidget.image_state = IMAGE_STATE_LOADED
 
-        self.image_filepath = filepath
+            self.animation_frame = frame or 0
+            self.imageWidget.image_state = IMAGE_STATE_DECODING
+            self.decoder_request_queue.put((filepath, (file_data, self.imageWidget, None, reader)))
+
+            # Pending thumbnails have been removed from the decoder queue,
+            # refresh
+            self.updateThumbnails()
+
         
-        # Reset the scroll unless it's another frame of an animated image
-        if (frame is None):
-            # XXX Resetting the scroll here is probably redundant with other
-            #     places?
-            self.imageWidget.scroll = 0
-        # XXX Is this image to pixmap to setpixmap redundant? should we use image?
-        #     or pixmap?
-        self.imageWidget.setPixmap(pixmap)
-
-        if (self.animation_count > 1):
-            new_report_time = time.time()
-            self.animation_fps = (1.0 / (new_report_time - self.animation_report_time))
-            self.animation_report_time = new_report_time
-
-        self.updateImage()
-
-        info("Statusing")
-        self.statusFilepath.setText(filepath)
-        self.statusResolution.setText("%d x %d x %d BPP" % (image.size().width(), image.size().height(), image.depth()))
-        self.statusSize.setText("%s / %s (%s)" % (
-            size_to_human_friendly_units(len(file_data)), 
-            size_to_human_friendly_units(image.byteCount()),
-            size_to_human_friendly_units(
-                sum([(0 if entry_file_data is None else len(entry_file_data)) for entry_filepath, (entry_file_data, entry_file_stat) in self.cached_files]) + 
-                # XXX These getsize cause a noticeable stall, and they are not
-                #     cached yet so can't be obtained from the cache
-                # sum([os.path.getsize(entry_filepath) for entry_filepath in self.prefetch_pending])
-                0
-                )
-        ))
-
-        filedate = datetime.datetime.fromtimestamp(0 if file_stat is None else file_stat.st_mtime)
-        self.statusDate.setText("%s" % filedate.strftime("%Y-%m-%d %H:%M:%S"))
-        self.statusIndex.setText("%d / %d" % (self.image_index + 1, self.image_count))
-        info("Statused")
-
-        self.updateStatus()
-        self.updateActions()
 
     def updateImage(self, redraw=True):
         info("updateImage")
@@ -2014,7 +2343,7 @@ class ImageViewer(QMainWindow):
         s = "" if (self.image_count == 1) else " [%d / %d]" % (self.image_index + 1, self.image_count)
         if (self.fullscreenAct.isChecked()):
             if (self.animationAct.isChecked() and self.animationAct.isEnabled()):
-                s += " %2.2f fps" % self.animation_fps
+                s += " %d/%d %2.2f fps" % (self.animation_frame, self.animation_count, self.animation_fps)
             self.imageWidget.setText("%s%s" % (self.image_filepath, s))
 
         else:
@@ -2041,7 +2370,11 @@ class ImageViewer(QMainWindow):
         info("updateStatus")
 
         widget_size = self.imageWidget.size()
-        orig_pixmap_size = self.imageWidget.originalPixmap.size()
+        
+        # XXX This shows the previous image information when loading, get the
+        #     state and show ?? instead?
+        orig_pixmap = self.imageWidget.originalPixmap
+        orig_pixmap_size = orig_pixmap.size()
         pixmap_size = self.imageWidget.pixmap().size()
 
         info("pixmap size %s widget_size %s", widget_size, pixmap_size)
@@ -2049,7 +2382,10 @@ class ImageViewer(QMainWindow):
             zoom_factor = (pixmap_size.width() * 100) / orig_pixmap_size.width()
         else:
             zoom_factor = (pixmap_size.height() * 100) / orig_pixmap_size.height()
-        
+
+        self.statusIndex.setText("%d / %d" % (self.image_index + 1, self.image_count))
+        self.statusResolution.setText("%d x %d x %d BPP" % (orig_pixmap.width(), orig_pixmap.height(), orig_pixmap.depth()))
+
         self.statusZoom.setText("%d%% %s %s %d d %d/%d%s" % (
             zoom_factor,
             "S" if self.imageWidget.fitToSmallest else "L",
@@ -2059,6 +2395,40 @@ class ImageViewer(QMainWindow):
             self.animation_count, 
             " %2.1f" % self.animation_fps if (self.animationAct.isEnabled() and self.animationAct.isChecked()) else ""
         ))
+
+        self.statusFilepath.setText(os_path_abspath(self.image_filepath))
+
+        info("Statusing")
+        # XXX Store elsewhere instead of hitting the cache which will mess with
+        #     the LRU? Find it directly in cached_files?
+        data = self.getDataFromCache(self.image_filepath) 
+        if (data):
+            file_data, file_stat = data
+            if (file_data is None):
+                file_data = []
+        else:
+            file_data = None
+            file_stat = None
+        self.statusSize.setText("%s / %s (%d: %s)" % (
+            "?? MB" if (file_data is None) else size_to_human_friendly_units(len(file_data)), 
+            # XXX This should use image.byteCount() but there's none for QPixmap
+            size_to_human_friendly_units(orig_pixmap.width() * orig_pixmap.height()*orig_pixmap.depth()),
+            # XXX This accesses the queue directly, could use prefetch_pending
+            #     but it's not updated frequently
+            len(self.prefetch_pending),
+            size_to_human_friendly_units(
+                sum([(0 if entry_file_data is None else len(entry_file_data)) for entry_filepath, (entry_file_data, entry_file_stat) in self.cached_files]) + 
+                # XXX These getsize cause a noticeable stall, and they are not
+                #     cached yet so can't be obtained from the cache
+                # sum([os.path.getsize(entry_filepath) for entry_filepath in self.prefetch_pending])
+                0
+                )
+        ))
+
+        filedate = None if file_stat is None else datetime.datetime.fromtimestamp(file_stat.st_mtime)
+        self.statusDate.setText("%s" % ("??-??-?? ??:??:??" if (filedate is None) else filedate.strftime("%Y-%m-%d %H:%M:%S")))
+
+        info("Statused")
 
     def deleteImage(self):
         if (QMessageBox.question(self, "Image Viewer",
@@ -2088,7 +2458,10 @@ class ImageViewer(QMainWindow):
             #     .lst file, fix
             self.image_filepaths = None
             self.cached_files = []
-            self.filepath_to_thumbnail_pixmap.clear()
+            for thumbWidget in self.thumbWidgets:
+                thumbWidget.image_filepath = None
+                thumbWidget.image_state = IMAGE_STATE_INIT
+                thumbWidget.image_data = None
 
         else:
             # XXX This try is not necessary unless loadimage is non-blocking 
@@ -2098,11 +2471,12 @@ class ImageViewer(QMainWindow):
                 filepaths = [entry_filepath for entry_filepath, entry_data in self.cached_files]
                 i = filepaths.index(filepath)
                 self.cached_files.pop(i)
-                # Note filepath may not be in thumbnails if in the thumnail pane
-                # is not shown
-                if (filepath in self.filepath_to_thumbnail_pixmap):
-                    del self.filepath_to_thumbnail_pixmap[filepath]
-        
+                for thumbWidget in self.thumbWidgets:
+                    if (thumbWidget.image_filepath == filepath):
+                        thumbWidget.image_filepath = None
+                        thumbWidget.image_state = IMAGE_STATE_INIT
+                        thumbWidget.image_data = None
+                        
             except ValueError:
                 pass
 
@@ -2111,7 +2485,9 @@ class ImageViewer(QMainWindow):
     def animationToggled(self):
         if (self.animationAct.isChecked()):
             info("starting animation timer")
+            self.animation_timer_start = self.animation_timer
             self.animation_timer.start(animation_interval_ms)
+            
             # fps indicator will be shown when the new frame is loaded
         
         else:
@@ -2160,6 +2536,7 @@ class ImageViewer(QMainWindow):
         self.updateStatus()
 
     def thumbnailsToggled(self):
+        info("thumbnailsToggled")
         states = ((True, False), (True, True), (False, True))
         i = states.index((self.imageWidget.isVisible(), self.thumbnailsWidget.isVisible()))
         delta =  -1 if (QApplication.keyboardModifiers() & Qt.ShiftModifier) else 1
@@ -2220,6 +2597,7 @@ class ImageViewer(QMainWindow):
             info("listing %r", image_dirname)
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
+                # XXX This could happen on another thread
                 filenames = os.listdir(image_dirname)
 
             except:
@@ -2255,6 +2633,8 @@ class ImageViewer(QMainWindow):
         # XXX This needs error handling if the current dirpath is invalid, 
         #     in which case filepaths is empty and should go directly to show
         #     the open dialog box
+        # XXX This fails if images have the same path, can happen with .lst
+        #     files with repeated entries, support or filter at .lst load time?
         try:
             prev_i = filepaths.index(self.image_filepath)
 
@@ -2282,17 +2662,34 @@ class ImageViewer(QMainWindow):
             # Prefetch around the current image if not already pending or
             # prefetched
             
-            # Start with the current index, then leapfrog between the next
-            # forward and backward prefetching (this prefetches out of order wrt
-            # delta, but note that images will be returned out of order anyway
-            # if there are multiple prefetch threads)
+            # Start with the current index, then prefetch half prefetch count
+            # forwards and then half backwards. This helps fetching the next
+            # probable image assuming the browsing direction is forwards and if
+            # there's a thumbnail page being shown (prefetches will finish out
+            # of order with multiple prefetch threads, but still prioritizes
+            # what is probably visible)
+            
+            # XXX When navigating (eg by pgup/pgdown) to the middle of a new
+            #     thumbnail page, blindly prioritizing forward images can cause
+            #     invisibile thumbnails in the next page to be fetched before a
+            #     previous visible thumbnail in this page, should prioritize 
+            #     visible thumbnails?
             # XXX This should favor the browsing direction?
             # XXX Think if this is the right prefetch behavior, right now when
             #     moving up/down/left/right it's fetching and evicting images,
             #     have some page granularity so it doesn't fetch if moving inside 
             #     the same page?
-            delta = 1
-            for _ in xrange(self.prefetched_images_max_count):
+            # XXX Move this prefetch after updateThumbnails so the thumbnails
+            #     are requested first and then any additional prefetches, but
+            #     will still fight and evict thumbnails if one and the other are
+            #     not aware of each other?
+            for j in xrange(self.prefetched_images_max_count):
+                delta = j
+                if (j <= self.prefetched_images_max_count / 2):
+                    delta = j
+                else:
+                    # prefetch backwards, starting with the previous image
+                    delta = (self.prefetched_images_max_count / 2) - j 
                 filepath = filepaths[(i + delta + len(filepaths)) % len(filepaths)]
                 if ((filepath not in self.prefetch_pending) and 
                     # XXX Have a set for cached images instead of a an all() reduce
@@ -2301,14 +2698,9 @@ class ImageViewer(QMainWindow):
                     self.prefetch_request_queue.put(filepath)
                     self.prefetch_pending.add(filepath)
                 
-                delta = -delta
-                if (delta > 0):
-                    delta += 1
-
         if (self.slideshow_timer is not None):
             self.slideshow_timer.start(slideshow_interval_ms)
 
-        # Update thumbnails explicitly to avoid updateThumbnailsTimer latency
         self.updateThumbnails()
         
     def toggleFit(self):
@@ -2352,9 +2744,57 @@ class ImageViewer(QMainWindow):
         return canvas_limit, pixmap_limit
 
     def nextFrame(self):
-        info("nextFrame %d", self.animation_frame)
-        
-        self.loadImage(self.image_filepath, frame=self.animation_frame + 1)
+        # It's possible that this is a stale callback from a previous animation
+        # image timer, ignore if so. Note that despit both the call to stop()
+        # and nextframe() being done in the UI thread, stop() is racy wrt to the
+        # timeout event being posted on the UI thread, so just stopping the
+        # previous timer before creating the new one doesn't prevent this issue,
+        # and the timer object being the same needs to be checked as well.
+        stale_frame = self.animation_timer_start is not self.animation_timer
+        info("nextFrame %d stale %s", self.animation_frame, stale_frame)
+        if (not stale_frame):
+            if ((self.animation_timer is not None) and (self.animationAct.isChecked())):
+                self.animation_timer_start = self.animation_timer
+                self.animation_timer.start(animation_interval_ms)
+
+            # In addition to stale timer calls, there's an additional race
+            # condition that causes null pixmaps in receive_pixmap because a
+            # recycled reader is accessed simultaneously from two threads: This
+            # happens when the decoder thread for frame N is not done reading
+            # when frame N+1 is scheduled, even the decoder queue is cleared
+            # before queueing frame N+1, frame N can be currently being decoded,
+            # so not in the queue and not removed. This doesn't happen with
+            # different (non frame) images because there's a check for stale
+            # decoding comparing filenames.
+
+            # The symptom is that pixmap is null in receive_image and the
+            # "invalid image file" pops up. Probably this can still happen fi by
+            # the time loadImage is called the timer is already in the queue,
+            # investigate further?
+            
+            # XXX Theoretically could also happen with non-animated images if
+            #     one image is switched on off and on again fast enough?
+            
+            # Possible fixes:
+            # - Reschedule/skip the frame if the previous frame hasn't been
+            #   decoded yet? (have a setting to reschedule vs. skip?
+            #   skipping would also fix the "same image switched fast
+            #   enough" case since the second decoding is redundant?)
+            # - do a sequence id to check for stale frames instead of
+            #   checking filepath?
+            # - mutex the access to a recycled reader? But this won't
+            #   guarantee frame ordering and will confuse the reader since
+            #   threads can be interrupted and serviced out of order
+            # - Have a single queue for decoding images? (only images
+            #   recycle readers, thumbnails don't)
+
+            # Detect if the image has been decoded and reschedule otherwise
+            if (self.imageWidget.image_state == IMAGE_STATE_DECODED):
+                self.loadImage(self.image_filepath, frame=self.animation_frame + 1)
+            else:
+                # XXX Skip this frame? Flag and schedule as soon as it's ready
+                #     instead of delaying one full interval?
+                info("Previous frame not ready, delaying")
 
     def prevImage(self):
         info("prevImage")
@@ -2481,6 +2921,9 @@ class ImageViewer(QMainWindow):
         # XXX Support multiple image selection
         # XXX Support image search/filtering by filename
         # XXX Support saving thumbnail page/s as big image
+        # XXX Support saving thumbnails to a directory and fetching from there
+        #     (or with _thumb extension/configurable, etc) instead of the big
+        #     images
         
         self.toggleFitAct = createGlobalAction("&Fit To Smallest", enabled=False, 
             shortcut="F", triggered=lambda : self.toggleFit())

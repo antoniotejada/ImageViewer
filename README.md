@@ -102,7 +102,7 @@ fortunately some versions of Anaconda do support PyQt5 and 32-bit Windows XP.
 - Delete current image
 - Refresh current image
 - Toggable thumbnail splitter pane
-- Asynchronous tumnbnail loading
+- Background thread image and thumbnail prefetch and decoding
 
 ## Requirements
 - Python 2.7
