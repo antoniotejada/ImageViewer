@@ -507,7 +507,7 @@ class PixmapReader(QThread):
                 buffer = QBuffer()
                 buffer.setData(file_data)
                 reader = qThreadSafeImageReader(buffer)
-                info("Using new reader %r", reader)
+                info("Created new reader %r", reader)
 
             else:
                 # Note this will fail if a recycled reader is used in multiple
@@ -517,9 +517,9 @@ class PixmapReader(QThread):
                 # multiple frames for the same image, so this should be safe.
                 # XXX Prevent by having a single main image queue?
                 info("Recycling reader %r", reader)
-            info("Reading image %r %d", filepath, len(file_data or []))
+            info("Reading image from buffer %r %d", filepath, len(file_data or []))
             image = reader.read()
-            info("Converting image %r", filepath)
+            info("Converting image to pixmap %r", filepath)
             pixmap = QPixmap.fromImage(image)
             info("Scaling pixmap %r", filepath)
             if ((not pixmap.isNull()) and (scale is not None)):
@@ -1749,7 +1749,7 @@ class ImageViewer(QMainWindow):
         # (note the prefetches in flight will still be serviced and put in the
         # reponse queue)
         # XXX Ideally pause/stop/abort in flight too?
-        # Reset image_filepaths so updatethumbnails stops requesting images
+        # Reset image_filepaths so updateThumbnails stops requesting images
         # XXX Also do something so in flight requests don't start decoding threads?
         # XXX Stopping requests this way is kludgy, should have some background
         #     task enabled flag that is checked in multiple places?
@@ -1948,7 +1948,7 @@ class ImageViewer(QMainWindow):
                         (thumbWidget.image_state == IMAGE_STATE_LOADING)):
                         thumbWidget.image_state = IMAGE_STATE_INIT
                 
-                entries =[fp for (fp, _, _, _, _) in self.decoder_request_queue.clear()]
+                entries =[fp for (fp, payload) in self.decoder_request_queue.clear()]
                 info("removing %d stale decode requests", len(entries))
                 entries = set(entries)
                 for thumbWidget in self.thumbWidgets:
@@ -3244,8 +3244,8 @@ def report_versions():
 
 logger = logging.getLogger(__name__)
 setup_logger(logger)
-#logger.setLevel(logging.WARNING)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)
+#logger.setLevel(logging.INFO)
 
 if (__name__ == '__main__'):
     report_versions()
